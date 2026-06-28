@@ -9,7 +9,7 @@ namespace Elypha.VRChatUploader
 {
     internal static class AvatarBuildCache
     {
-        private const string CacheFolderName = "ElyphaVRChatUploader";
+        private const string CacheFolderName = "Elypha-VRChatUploader";
 
         public static string CacheDirectory
         {
@@ -43,7 +43,7 @@ namespace Elypha.VRChatUploader
                 bundlePath = cachePath,
                 sizeBytes = new FileInfo(cachePath).Length,
                 md5Base64 = AvatarFileUtil.ComputeMd5Base64(cachePath),
-                createdAtLocal = DateTime.Now.ToString("O")
+                createdAtLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
             };
 
             File.WriteAllText(ManifestPathForBundle(cachePath), JsonUtility.ToJson(manifest, true));
@@ -103,6 +103,38 @@ namespace Elypha.VRChatUploader
                 .ToList();
         }
 
+        public static void Delete(CachedAvatarBundleManifest manifest)
+        {
+            if (manifest == null)
+            {
+                return;
+            }
+
+            DeleteBundle(manifest.bundlePath);
+        }
+
+        public static void DeleteBundle(string bundlePath)
+        {
+            if (string.IsNullOrWhiteSpace(bundlePath))
+            {
+                return;
+            }
+
+            var fullBundlePath = Path.GetFullPath(bundlePath);
+            EnsurePathIsInCache(fullBundlePath);
+
+            var manifestPath = ManifestPathForBundle(fullBundlePath);
+            if (File.Exists(fullBundlePath))
+            {
+                File.Delete(fullBundlePath);
+            }
+
+            if (File.Exists(manifestPath))
+            {
+                File.Delete(manifestPath);
+            }
+        }
+
         private static CachedAvatarBundleManifest LoadManifestForBundle(string bundlePath)
         {
             return LoadManifest(ManifestPathForBundle(bundlePath));
@@ -128,6 +160,20 @@ namespace Elypha.VRChatUploader
         private static string ManifestPathForBundle(string bundlePath)
         {
             return bundlePath + ".json";
+        }
+
+        private static void EnsurePathIsInCache(string path)
+        {
+            var cacheDirectory = Path.GetFullPath(CacheDirectory);
+            if (!cacheDirectory.EndsWith(Path.DirectorySeparatorChar.ToString()))
+            {
+                cacheDirectory += Path.DirectorySeparatorChar;
+            }
+
+            if (!path.StartsWith(cacheDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Refusing to delete a bundle outside the uploader cache: " + path);
+            }
         }
     }
 

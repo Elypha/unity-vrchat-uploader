@@ -63,10 +63,23 @@ namespace Elypha.VRChatUploader
             return manifest;
         }
 
+        public async Task<CachedAvatarBundleManifest> BuildCacheAndUploadOfficial(CancellationToken token)
+        {
+            var context = await PrepareAvatarContext(needsUpload: true, token);
+            var manifest = await BuildAndCache(context, token);
+            await UploadCachedOfficial(context, manifest, token);
+            return manifest;
+        }
+
         public async Task UploadCachedOfficial(CancellationToken token)
         {
             var context = await PrepareAvatarContext(needsUpload: true, token);
             var manifest = AvatarBuildCache.LoadAndValidateForUpload(request.CachedBundlePath, context);
+            await UploadCachedOfficial(context, manifest, token);
+        }
+
+        private async Task UploadCachedOfficial(AvatarUploadContext context, CachedAvatarBundleManifest manifest, CancellationToken token)
+        {
             await EnsureCopyrightAgreement(context, token);
 
             var uploadWatch = System.Diagnostics.Stopwatch.StartNew();
