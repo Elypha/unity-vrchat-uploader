@@ -8,7 +8,7 @@
         "url": "https://elypha.com"
     },
     "url": "https://github.com/Elypha/unity-vrchat-uploader",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "license": "AGPL-3.0-only",
     "unity": "2022.3",
     "vpmDependencies": {
