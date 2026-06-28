@@ -6,20 +6,21 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: write
+
 env:
   packageName: "com.elypha.unity-vrchat-uploader"
-  pagesRepo: "Elypha/unity-packages"
 
 jobs:
   build-assets:
     runs-on: ubuntu-latest
-    outputs:
-      packageVersion: ${{ steps.info.outputs.packageVersion }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: "true"
+          fetch-depth: 0
 
       - name: Prepare package information
         id: info
@@ -39,13 +40,23 @@ jobs:
           include-files: metaList
 
       - name: Create zip
-        run: zip -r ${{ steps.info.outputs.zipName }} . -x ".git/*" ".github/*"
+        run: zip -r ${{ steps.info.outputs.zipName }} . -x ".git/*" ".github/*" "metaList" "RELEASE_NOTES.md"
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: .github/cliff.toml
+          args: -vv --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
 
       - name: Make Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          draft: false
           prerelease: false
+          body_path: RELEASE_NOTES.md
           files: |
             ${{ steps.info.outputs.zipName }}
             ${{ steps.info.outputs.unitypackageName }}
