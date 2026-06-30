@@ -25,14 +25,17 @@ namespace Elypha.VRChatUploader
         private readonly int workers;
         private readonly int partSizeMiB;
         private readonly Action<string> log;
-        private readonly Action<string, float> progress;
+        private readonly AvatarUploadProgressHandler progress;
+        private readonly AvatarUploadWorkerProgressHandler workerProgress;
 
-        public AvatarUploadProtocol(int workers, int partSizeMiB, Action<string> log, Action<string, float> progress)
+        public AvatarUploadProtocol(int workers, int partSizeMiB, Action<string> log, AvatarUploadProgressHandler progress,
+            AvatarUploadWorkerProgressHandler workerProgress = null)
         {
             this.workers = Mathf.Clamp(workers, 1, 8);
             this.partSizeMiB = Mathf.Clamp(partSizeMiB, 8, 100);
             this.log = log;
             this.progress = progress;
+            this.workerProgress = workerProgress;
         }
 
         public int Workers => workers;
@@ -98,7 +101,7 @@ namespace Elypha.VRChatUploader
                 currentFile = await VRCApi.Get<VRCFile>("file/" + currentFile.ID, forceRefresh: true, cancellationToken: token);
             }
 
-            progress?.Invoke("Processing file", 0.05f);
+            ReportUploadProgress("Processing file", 0.05f);
             var fileMd5Bytes = AvatarFileUtil.ComputeMd5Bytes(filename);
             var fileMd5Base64 = Convert.ToBase64String(fileMd5Bytes);
             var fileSize = new FileInfo(filename).Length;
@@ -184,12 +187,12 @@ namespace Elypha.VRChatUploader
                     if (fileDescriptor.Category == "simple")
                     {
                         await UploadSimple(filename, FileUploadType.File, currentFile, mimeType, fileMd5Bytes,
-                            (status, percentage) => progress?.Invoke(status, 0.15f + percentage * 0.75f), token);
+                            (status, percentage) => ReportUploadProgress(status, 0.15f + percentage * 0.75f), token);
                     }
                     else
                     {
                         await UploadMultipart(filename, FileUploadType.File, currentFile,
-                            (status, percentage) => progress?.Invoke(status, 0.15f + percentage * 0.75f), token);
+                            (status, percentage) => ReportUploadProgress(status, 0.15f + percentage * 0.75f), token);
                     }
                 }
                 else
@@ -209,12 +212,12 @@ namespace Elypha.VRChatUploader
                     if (signatureDescriptor.Category == "simple")
                     {
                         await UploadSimple(signaturePath, FileUploadType.Signature, currentFile, signatureMimeType,
-                            signatureMd5Bytes, (status, percentage) => progress?.Invoke(status, 0.92f + percentage * 0.07f), token);
+                            signatureMd5Bytes, (status, percentage) => ReportUploadProgress(status, 0.92f + percentage * 0.07f), token);
                     }
                     else
                     {
                         await UploadMultipart(signaturePath, FileUploadType.Signature, currentFile,
-                            (status, percentage) => progress?.Invoke(status, 0.92f + percentage * 0.07f), token);
+                            (status, percentage) => ReportUploadProgress(status, 0.92f + percentage * 0.07f), token);
                     }
                 }
                 else
@@ -232,7 +235,7 @@ namespace Elypha.VRChatUploader
                     throw new UploadException($"VRCApi.UploadFile/AvatarBundle: final file URL is empty. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 }
 
-                progress?.Invoke("File upload finished", 1f);
+                ReportUploadProgress("File upload finished", 1f);
                 return latest.File.URL;
             }
             finally
@@ -301,10 +304,16 @@ namespace Elypha.VRChatUploader
                 token.ThrowIfCancellationRequested();
                 var batchEnd = Math.Min(parts, batchStart + workers - 1);
                 var tasks = new List<Task<PartUploadResult>>();
+                for (var workerIndex = 0; workerIndex < workers; workerIndex++)
+                {
+                    workerProgress?.Invoke(workerIndex, "", 0f);
+                }
+
                 for (var partNumber = batchStart; partNumber <= batchEnd; partNumber++)
                 {
+                    var workerIndex = partNumber - batchStart;
                     tasks.Add(UploadMultipartPart(filename, fileUploadType, currentFile, partNumber, parts, fileSize,
-                        partSizeBytes, onProgress, token));
+                        partSizeBytes, workerIndex, onProgress, token));
                 }
 
                 var results = await Task.WhenAll(tasks);
@@ -337,7 +346,7 @@ namespace Elypha.VRChatUploader
 
         private async Task<PartUploadResult> UploadMultipartPart(string filename, FileUploadType fileUploadType,
             VRCFile currentFile, int partNumber, int parts, long fileSize, int partSizeBytes,
-            Action<string, float> onProgress, CancellationToken token)
+            int workerIndex, Action<string, float> onProgress, CancellationToken token)
         {
             var uploadKind = fileUploadType.ToString().ToLowerInvariant();
             var startEndpoint = $"file/{currentFile.ID}/{currentFile.GetLatestVersion()}/{uploadKind}/start";
@@ -360,6 +369,8 @@ namespace Elypha.VRChatUploader
 
             var bytes = await AvatarFileUtil.ReadFileRange(filename, offset, (int)bytesToRead, token);
             log($"VRCApi.UploadMultipart/AvatarBundle: part PUT started. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}, offset={offset}, size={AvatarFileUtil.FormatBytes(bytes.LongLength)}.");
+            var partStatus = $"{fileUploadType} part {partNumber}/{parts}";
+            workerProgress?.Invoke(workerIndex, partStatus, 0f);
             var partProgressStart = (float)(partNumber - 1) / parts;
             var perPartProgress = 1f / parts;
             var result = await VRCApi.MakeRequestWithResponse<byte[], byte[]>(
@@ -370,6 +381,7 @@ namespace Elypha.VRChatUploader
                 onProgress: percentage =>
                 {
                     var total = partProgressStart + percentage * perPartProgress;
+                    workerProgress?.Invoke(workerIndex, partStatus, percentage);
                     onProgress?.Invoke($"Uploading {fileUploadType} part {partNumber}/{parts} ({percentage * 100f:F0}%)", total);
                 },
                 cancellationToken: token);
@@ -381,8 +393,12 @@ namespace Elypha.VRChatUploader
             }
 
             log($"VRCApi.UploadMultipart/AvatarBundle: part complete. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}, etag={etag}.");
+            workerProgress?.Invoke(workerIndex, partStatus, 1f);
             return new PartUploadResult(partNumber, etag);
         }
+
+        private void ReportUploadProgress(string status, float percentage) =>
+            progress?.Invoke(AvatarUploadProgressStage.Upload, status, percentage);
 
         public static bool IsAlreadyUploadedError(Exception ex)
         {

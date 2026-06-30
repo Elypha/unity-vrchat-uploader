@@ -17,7 +17,6 @@ namespace Elypha.VRChatUploader
     {
         public GameObject AvatarRoot;
         public string NewAvatarName;
-        public string NewAvatarDescription;
         public string NewAvatarReleaseStatus;
         public string CoverImagePath;
         public string CachedBundlePath;
@@ -33,13 +32,16 @@ namespace Elypha.VRChatUploader
 
         private readonly AvatarUploadRequest request;
         private readonly Action<string> log;
-        private readonly Action<string, float> progress;
+        private readonly AvatarUploadProgressHandler progress;
+        private readonly AvatarUploadWorkerProgressHandler workerProgress;
 
-        public AvatarUploadWorkflow(AvatarUploadRequest request, Action<string> log, Action<string, float> progress)
+        public AvatarUploadWorkflow(AvatarUploadRequest request, Action<string> log, AvatarUploadProgressHandler progress,
+            AvatarUploadWorkerProgressHandler workerProgress = null)
         {
             this.request = request;
             this.log = log;
             this.progress = progress;
+            this.workerProgress = workerProgress;
         }
 
         public async Task<CachedAvatarBundleManifest> BuildCache(CancellationToken token)
@@ -51,6 +53,7 @@ namespace Elypha.VRChatUploader
         public async Task UploadCachedConcurrent(CancellationToken token)
         {
             var context = await PrepareAvatarContext(needsUpload: true, token);
+            progress(AvatarUploadProgressStage.Prepare, "Loading cached bundle", 0.5f);
             var manifest = AvatarBuildCache.LoadAndValidateForUpload(request.CachedBundlePath, context);
             await UploadCachedConcurrent(context, manifest, token);
         }
@@ -74,6 +77,7 @@ namespace Elypha.VRChatUploader
         public async Task UploadCachedOfficial(CancellationToken token)
         {
             var context = await PrepareAvatarContext(needsUpload: true, token);
+            progress(AvatarUploadProgressStage.Prepare, "Loading cached bundle", 0.5f);
             var manifest = AvatarBuildCache.LoadAndValidateForUpload(request.CachedBundlePath, context);
             await UploadCachedOfficial(context, manifest, token);
         }
@@ -89,24 +93,26 @@ namespace Elypha.VRChatUploader
                 try
                 {
                     log($"Official SDK upload attempt {attempt}/{request.UploadAttempts}; bundle MD5={manifest.md5Base64}.");
-                    progress($"Official upload {attempt}/{request.UploadAttempts}", 0f);
+                    progress(AvatarUploadProgressStage.Upload, $"Official upload {attempt}/{request.UploadAttempts}", 0f);
 
                     if (context.FirstTimeUpload)
                     {
                         await VRCApi.CreateNewAvatar(context.AvatarId, context.Avatar, manifest.bundlePath,
-                            context.PreparedThumbnailPath, progress, token);
+                            context.PreparedThumbnailPath, ProgressForStage(AvatarUploadProgressStage.Upload), token);
                     }
                     else
                     {
                         await VRCApi.UpdateAvatarBundle(context.AvatarId, context.Avatar, manifest.bundlePath,
-                            progress, token);
+                            ProgressForStage(AvatarUploadProgressStage.Upload), token);
                     }
 
+                    progress(AvatarUploadProgressStage.Verify, "Verifying avatar bundle", 0f);
                     var avatar = await VRCApi.GetAvatar(context.AvatarId, forceRefresh: true, cancellationToken: token);
                     if (await RemoteAvatarPointsAtBundle(avatar, manifest.md5Base64, token))
                     {
                         uploadWatch.Stop();
                         log($"Official upload verified: {uploadWatch.Elapsed.TotalSeconds:F2}s.");
+                        progress(AvatarUploadProgressStage.Verify, "Avatar bundle verified", 1f);
                         return;
                     }
 
@@ -114,6 +120,7 @@ namespace Elypha.VRChatUploader
                     {
                         uploadWatch.Stop();
                         log($"Official upload finalized existing completed version: {uploadWatch.Elapsed.TotalSeconds:F2}s.");
+                        progress(AvatarUploadProgressStage.Verify, "Avatar bundle verified", 1f);
                         return;
                     }
 
@@ -131,6 +138,7 @@ namespace Elypha.VRChatUploader
 
         private async Task<AvatarUploadContext> PrepareAvatarContext(bool needsUpload, CancellationToken token)
         {
+            progress(AvatarUploadProgressStage.Prepare, "Preparing avatar context", 0f);
             var pipelineManager = ValidateAvatarRoot();
             if (APIUser.CurrentUser == null)
             {
@@ -167,14 +175,14 @@ namespace Elypha.VRChatUploader
                 var avatar = new VRCAvatar
                 {
                     Name = name,
-                    Description = request.NewAvatarDescription ?? "",
+                    Description = "",
                     ReleaseStatus = NormalizeReleaseStatus(request.NewAvatarReleaseStatus),
                     Tags = new List<string>()
                 };
 
                 log($"Reserving new avatar ID for \"{avatar.Name}\".");
-                progress("Reserving avatar ID", 0f);
-                avatar = await VRCApi.CreateAvatarRecord(avatar, progress, token);
+                progress(AvatarUploadProgressStage.Prepare, "Reserving avatar ID", 0.25f);
+                avatar = await VRCApi.CreateAvatarRecord(avatar, ProgressForStage(AvatarUploadProgressStage.Prepare), token);
                 if (string.IsNullOrWhiteSpace(avatar.ID))
                 {
                     throw new UploadException("Failed to reserve a new avatar ID.");
@@ -189,6 +197,7 @@ namespace Elypha.VRChatUploader
             }
 
             log("Loading remote avatar " + pipelineManager.blueprintId + ".");
+            progress(AvatarUploadProgressStage.Prepare, "Loading remote avatar", 0.5f);
             var remoteAvatar = await VRCApi.GetAvatar(pipelineManager.blueprintId, forceRefresh: true, cancellationToken: token);
             if (string.IsNullOrWhiteSpace(remoteAvatar.ID))
             {
@@ -225,7 +234,7 @@ namespace Elypha.VRChatUploader
             {
                 var builder = await GetAvatarBuilder(token);
                 log($"Starting SDK build for {request.AvatarRoot.name} ({context.AvatarId}).");
-                progress("Building avatar bundle", 0f);
+                progress(AvatarUploadProgressStage.Build, "Building avatar bundle", 0f);
 
                 VRC_SdkBuilder.ActiveBuildType = VRC_SdkBuilder.BuildType.Publish;
                 var buildWatch = System.Diagnostics.Stopwatch.StartNew();
@@ -236,7 +245,7 @@ namespace Elypha.VRChatUploader
                 buildWatch.Stop();
                 log($"Cached bundle: {manifest.bundlePath}");
                 log($"Build cache result: {buildWatch.Elapsed.TotalSeconds:F2}s, {AvatarFileUtil.FormatBytes(manifest.sizeBytes)}, MD5={manifest.md5Base64}.");
-                progress("Build cached", 1f);
+                progress(AvatarUploadProgressStage.Build, "Build cached", 1f);
                 return manifest;
             }
             catch
@@ -269,7 +278,8 @@ namespace Elypha.VRChatUploader
                 request.ConcurrentWorkers,
                 request.ConcurrentPartSizeMiB,
                 log,
-                progress);
+                progress,
+                workerProgress);
 
             var uploadWatch = System.Diagnostics.Stopwatch.StartNew();
             Exception lastError = null;
@@ -280,13 +290,16 @@ namespace Elypha.VRChatUploader
                 {
                     log($"Concurrent upload attempt {attempt}/{request.UploadAttempts}; workers={protocol.Workers}, partSizeMiB={protocol.PartSizeMiB}, bundle MD5={manifest.md5Base64}.");
                     var bundleUrl = await protocol.UploadAvatarBundle(context, manifest.bundlePath, token);
+                    progress(AvatarUploadProgressStage.Finalize, "Finalizing avatar record", 0f);
                     await FinalizeAvatarRecord(context, bundleUrl, token);
 
+                    progress(AvatarUploadProgressStage.Verify, "Verifying avatar bundle", 0f);
                     var avatar = await VRCApi.GetAvatar(context.AvatarId, forceRefresh: true, cancellationToken: token);
                     if (await RemoteAvatarPointsAtBundle(avatar, manifest.md5Base64, token))
                     {
                         uploadWatch.Stop();
                         log($"Concurrent upload verified: {uploadWatch.Elapsed.TotalSeconds:F2}s.");
+                        progress(AvatarUploadProgressStage.Verify, "Avatar bundle verified", 1f);
                         return;
                     }
 
@@ -302,6 +315,7 @@ namespace Elypha.VRChatUploader
                     {
                         uploadWatch.Stop();
                         log($"Concurrent upload recovered by finalizing the completed version: {uploadWatch.Elapsed.TotalSeconds:F2}s.");
+                        progress(AvatarUploadProgressStage.Verify, "Avatar bundle verified", 1f);
                         return;
                     }
 
@@ -335,7 +349,7 @@ namespace Elypha.VRChatUploader
                     context.AvatarId,
                     context.Avatar,
                     context.PreparedThumbnailPath,
-                    progress,
+                    ProgressForStage(AvatarUploadProgressStage.Finalize),
                     token);
                 context.Avatar = avatar;
                 context.ImageUrl = avatar.ImageUrl;
@@ -348,9 +362,11 @@ namespace Elypha.VRChatUploader
 
             var requestData = context.CreateFinalizeRequest(assetUrl);
             log("Finalizing avatar record with bundle URL.");
+            progress(AvatarUploadProgressStage.Finalize, "Finalizing avatar record", 0f);
             var finalized = await VRCApi.Put<Dictionary<string, object>, VRCAvatar>(
                 $"avatars/{context.AvatarId}", requestData, cancellationToken: token);
             context.Avatar = finalized;
+            progress(AvatarUploadProgressStage.Finalize, "Avatar record finalized", 1f);
         }
 
         private async Task<bool> TryFinalizeCompletedBundleVersion(AvatarUploadContext context, string localMd5, CancellationToken token)
@@ -450,6 +466,9 @@ namespace Elypha.VRChatUploader
 
             return pipelineManager;
         }
+
+        private Action<string, float> ProgressForStage(AvatarUploadProgressStage stage) =>
+            (status, percentage) => progress(stage, status, percentage);
 
         private static async Task<IVRCSdkAvatarBuilderApi> GetAvatarBuilder(CancellationToken token)
         {

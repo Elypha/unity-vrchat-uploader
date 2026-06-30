@@ -1,62 +1,95 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Scripting.APIUpdating;
+using VRC.Core;
+using VRC.SDKBase;
+using VRC.SDKBase.Editor;
+using VRC.SDKBase.Editor.Api;
 
 namespace Elypha.VRChatUploader
 {
     [MovedFrom(true, "Elypha.VRChatUploader", null, "ElyphaVRChatUploader")]
-    public sealed class VRChatUploader : EditorWindow
+    public sealed partial class VRChatUploader : EditorWindow
     {
         private const string WindowTitle = "VRChatUploader";
         private const string MenuPath = "Elypha/VRChatUploader";
-        private const int DefaultAttempts = 5;
+        private const int DefaultAttempts = 8;
         private const float DefaultRetryDelaySeconds = 5f;
         private const float LabelWidth = 155f;
-        private const float CompactLabelWidth = 112f;
+        private const float CacheActionsWidth = 188f;
+        private const int CacheVisibleRows = 6;
+        private const int MaxWorkerProgressBars = 8;
 
-        private static readonly string[] ReleaseStatusOptions = {"private", "public"};
+        private static readonly string[] ReleaseStatusOptions = { "private", "public" };
         private static readonly Color TitleColour = new(230f / 255f, 194f / 255f, 153f / 255f);
         private static readonly Color SubtitleColour = new(210f / 255f, 210f / 255f, 210f / 255f);
-        private static readonly Color SelectedCacheColour = new(102f / 255f, 153f / 255f, 255f / 255f);
+        private static readonly Color SelectedCacheColour = new(102f / 255f, 153f / 255f, 255f / 255f, 0.32f);
 
-        [SerializeField] private GameObject avatarRoot;
-        [SerializeField] private string newAvatarName;
-        [SerializeField] private string newAvatarDescription = "";
-        [SerializeField] private string newAvatarReleaseStatus = "private";
-        [SerializeField] private string coverImagePath;
-        [SerializeField] private string selectedBundlePath;
-        [SerializeField] private int uploadAttempts = DefaultAttempts;
-        [SerializeField] private float retryDelaySeconds = DefaultRetryDelaySeconds;
-        [SerializeField] private int concurrentWorkers = AvatarUploadProtocol.DefaultWorkers;
-        [SerializeField] private int concurrentPartSizeMiB = AvatarUploadProtocol.DefaultPartSizeMiB;
+        private static readonly AvatarUploadProgressStage[] BuildCacheProgressStages =
+        {
+            AvatarUploadProgressStage.Prepare,
+            AvatarUploadProgressStage.Build
+        };
 
-        private readonly VRChatUploaderLog log = new();
-        private List<CachedAvatarBundleManifest> cacheEntries = new();
-        private CancellationTokenSource cancellation;
-        private Vector2 mainScroll;
-        private Vector2 logScroll;
-        private Vector2 cacheScroll;
-        private bool busy;
-        private string currentStatus = "Idle";
-        private float currentProgress;
+        private static readonly AvatarUploadProgressStage[] UploadProgressStages =
+        {
+            AvatarUploadProgressStage.Prepare,
+            AvatarUploadProgressStage.Upload,
+            AvatarUploadProgressStage.Finalize,
+            AvatarUploadProgressStage.Verify
+        };
+
+        private static readonly AvatarUploadProgressStage[] BuildUploadProgressStages =
+        {
+            AvatarUploadProgressStage.Prepare,
+            AvatarUploadProgressStage.Build,
+            AvatarUploadProgressStage.Upload,
+            AvatarUploadProgressStage.Finalize,
+            AvatarUploadProgressStage.Verify
+        };
+
+        private static GUIStyle _cacheEntryLabelStyle;
+        private static GUIStyle _cacheEntryButtonStyle;
+
+        [SerializeField] private string _newAvatarReleaseStatus = "private";
+        [SerializeField] private string _coverImagePath;
+        [SerializeField] private int _uploadAttempts = DefaultAttempts;
+        [SerializeField] private float _retryDelaySeconds = DefaultRetryDelaySeconds;
+        [SerializeField] private int _concurrentWorkers = AvatarUploadProtocol.DefaultWorkers;
+        [SerializeField] private int _concurrentPartSizeMiB = AvatarUploadProtocol.DefaultPartSizeMiB;
+
+        private string _newAvatarName;
+        private string _selectedBundlePath;
+
+        private readonly AvatarSelectionState _avatar = new();
+        private readonly RemoteAvatarCheckState _remoteCheck = new();
+        private readonly OperationState _operation = new(MaxWorkerProgressBars);
+        private readonly VRChatUploaderLog _log = new();
+        private List<CachedAvatarBundleManifest> _allCacheEntries = new();
+        private Vector2 _mainScroll;
+        private Vector2 _logScroll;
+        private Vector2 _cacheScroll;
 
         [MenuItem(MenuPath, false, 1)]
         public static void Open()
         {
             var window = GetWindow<VRChatUploader>(WindowTitle);
-            window.minSize = new Vector2(520, 520);
+            window.minSize = new Vector2(550, 550);
         }
 
         private void OnEnable()
         {
-            if (avatarRoot == null && Selection.activeGameObject != null)
+            if (_avatar.Root == null
+                && Selection.activeGameObject != null
+                && TryGetAvatarDescriptorInParents(Selection.activeGameObject, out var avatarDescriptor))
             {
-                avatarRoot = Selection.activeGameObject;
+                UpdateAvatarInfo(avatarDescriptor);
             }
 
             RefreshCacheEntries();
@@ -64,21 +97,18 @@ namespace Elypha.VRChatUploader
 
         private void OnDisable()
         {
-            cancellation?.Cancel();
+            _operation.Cancellation?.Cancel();
             EditorUtility.ClearProgressBar();
         }
 
         private void OnGUI()
         {
-            mainScroll = EditorGUILayout.BeginScrollView(mainScroll, false, false, GUILayout.ExpandWidth(true));
+            _mainScroll = EditorGUILayout.BeginScrollView(_mainScroll, false, false, GUILayout.ExpandWidth(true));
 
-            using (new EditorGUI.DisabledScope(busy))
+            using (new EditorGUI.DisabledScope(_operation.Busy))
             {
                 DrawAvatarSection();
-                DrawBuildCacheSection();
-                DrawCacheManagementSection();
-                DrawUploadSection();
-                DrawCombinedOperationsSection();
+                DrawCacheSection();
             }
 
             DrawOperationSection();
@@ -87,112 +117,292 @@ namespace Elypha.VRChatUploader
 
         private void DrawAvatarSection()
         {
-            DrawTitle("Avatar");
+            DrawTitle($"Avatar  →  {_avatar.StatusText}");
+            var labelWidth = CalculateLabelWidth("Avatar Root", "Name", "Visibility", "Cover");
 
             using (new EditorGUILayout.HorizontalScope())
             {
-                EditorGUILayout.LabelField("Avatar Root", GUILayout.Width(LabelWidth));
-                avatarRoot = (GameObject)EditorGUILayout.ObjectField(avatarRoot, typeof(GameObject), true);
-                if (GUILayout.Button("Use Selection", GUILayout.Width(120)))
+                using (new EditorGUILayout.VerticalScope(GUILayout.ExpandWidth(true)))
                 {
-                    avatarRoot = Selection.activeGameObject;
-                    if (avatarRoot != null && string.IsNullOrWhiteSpace(newAvatarName))
+                    DrawAvatarSelector(labelWidth);
+
+                    using (new EditorGUI.DisabledScope(_avatar.Root == null))
                     {
-                        newAvatarName = avatarRoot.name;
-                    }
-                }
-            }
+                        _newAvatarName = DrawTextRow("Name",
+                            string.IsNullOrWhiteSpace(_newAvatarName) && _avatar.Root != null
+                                ? _avatar.Root.name
+                                : _newAvatarName,
+                            labelWidth);
 
-            DrawSubtitle("Metadata");
-            newAvatarName = DrawTextRow("Name", string.IsNullOrWhiteSpace(newAvatarName) && avatarRoot != null ? avatarRoot.name : newAvatarName);
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            EditorGUILayout.LabelField("Visibility", GUILayout.Width(labelWidth));
+                            var releaseIndex = Array.IndexOf(ReleaseStatusOptions, _newAvatarReleaseStatus);
+                            if (releaseIndex < 0) releaseIndex = 0;
+                            releaseIndex = GUILayout.Toolbar(releaseIndex, ReleaseStatusOptions, GUILayout.ExpandWidth(true));
+                            _newAvatarReleaseStatus = ReleaseStatusOptions[releaseIndex];
+                        }
 
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                EditorGUILayout.LabelField("Description", GUILayout.Width(LabelWidth));
-                newAvatarDescription = EditorGUILayout.TextArea(newAvatarDescription ?? "", GUILayout.MinHeight(42));
-            }
-
-            var releaseIndex = Array.IndexOf(ReleaseStatusOptions, newAvatarReleaseStatus);
-            if (releaseIndex < 0)
-            {
-                releaseIndex = 0;
-            }
-
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                EditorGUILayout.LabelField("Release Status", GUILayout.Width(LabelWidth));
-                releaseIndex = EditorGUILayout.Popup(releaseIndex, ReleaseStatusOptions);
-                newAvatarReleaseStatus = ReleaseStatusOptions[releaseIndex];
-            }
-
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                EditorGUILayout.LabelField("Cover", GUILayout.Width(LabelWidth));
-                coverImagePath = EditorGUILayout.TextField(coverImagePath);
-                if (GUILayout.Button("Pick", GUILayout.Width(56)))
-                {
-                    var picked = EditorUtility.OpenFilePanel("Pick avatar cover", AvatarBuildCache.CacheDirectory, "png,jpg,jpeg");
-                    if (!string.IsNullOrWhiteSpace(picked))
-                    {
-                        coverImagePath = picked;
+                        DrawCoverSelector(labelWidth);
                     }
                 }
 
-                if (GUILayout.Button("Clear", GUILayout.Width(56)))
+                GUILayout.Space(1);
+                using (new EditorGUILayout.VerticalScope())
                 {
-                    coverImagePath = "";
+                    GUILayout.Space(2);
+                    DrawVerticalSeparator(82, Color.grey);
+                }
+
+                GUILayout.Space(1);
+                using (new EditorGUILayout.VerticalScope(GUILayout.Width(96)))
+                {
+                    GUILayout.Space(2);
+                    using (new EditorGUI.DisabledScope(!CanRetryRemoteCheck()))
+                    {
+                        var buttonText = _remoteCheck.Phase switch
+                        {
+                            RemoteAvatarCheckPhase.Checking => "Checking",
+                            RemoteAvatarCheckPhase.Ok => "OK",
+                            RemoteAvatarCheckPhase.Failed => "Retry Check",
+                            _ => "No Blueprint",
+                        };
+                        if (GUILayout.Button(buttonText, GUILayout.Height(20)))
+                        {
+                            RunRemoteAvatarCheck(_avatar.BlueprintId);
+                        }
+                    }
+
+                    GUILayout.Space(4);
+                    using (new EditorGUI.DisabledScope(!IsAvatarInfoReady()))
+                    {
+                        if (GUILayout.Button("Build", GUILayout.Height(58)))
+                        {
+                            RunBuildCache();
+                        }
+                    }
                 }
             }
         }
 
-        private void DrawBuildCacheSection()
+        private void DrawAvatarSelector(float labelWidth)
         {
-            DrawTitle("Build Cache");
-
-            if (GUILayout.Button("Build Cache"))
-            {
-                _ = RunExclusive("build-cache", async token =>
-                {
-                    var manifest = await CreateWorkflow().BuildCache(token);
-                    selectedBundlePath = manifest.bundlePath;
-                });
-            }
-        }
-
-        private void DrawCacheManagementSection()
-        {
-            DrawTitle("Cache Management");
-
-            EditorGUILayout.LabelField("Cache Folder", AvatarBuildCache.CacheDirectory);
             using (new EditorGUILayout.HorizontalScope())
             {
-                EditorGUILayout.LabelField("Selected Bundle", GUILayout.Width(LabelWidth));
-                selectedBundlePath = EditorGUILayout.TextField(selectedBundlePath);
-                if (GUILayout.Button("Pick", GUILayout.Width(56)))
+                EditorGUILayout.LabelField("Avatar Root", GUILayout.Width(labelWidth));
+
+                using var check = new EditorGUI.ChangeCheckScope();
+                var selectedDescriptor = (VRC_AvatarDescriptor)EditorGUILayout.ObjectField(
+                    _avatar.Descriptor,
+                    typeof(VRC_AvatarDescriptor),
+                    true,
+                    GUILayout.ExpandWidth(true));
+
+                if (check.changed)
                 {
-                    var picked = EditorUtility.OpenFilePanel("Pick cached avatar bundle", AvatarBuildCache.CacheDirectory, "vrca");
-                    if (!string.IsNullOrWhiteSpace(picked))
+                    UpdateAvatarInfo(selectedDescriptor);
+                }
+
+                using (new EditorGUI.DisabledScope(Selection.activeGameObject == null))
+                {
+                    if (GUILayout.Button("Try Find", GUILayout.Width(60)))
                     {
-                        selectedBundlePath = picked;
+                        if (TryGetAvatarDescriptorInParents(Selection.activeGameObject, out var foundDescriptor))
+                        {
+                            UpdateAvatarInfo(foundDescriptor);
+                            EditorGUIUtility.PingObject(_avatar.Root);
+                        }
                     }
                 }
 
-                if (GUILayout.Button("Clear", GUILayout.Width(56)))
+                using (new EditorGUI.DisabledScope(_avatar.Root == null))
                 {
-                    selectedBundlePath = "";
+                    if (GUILayout.Button("Clear", GUILayout.Width(48)))
+                    {
+                        UpdateAvatarInfo(null);
+                    }
                 }
             }
+        }
 
-            if (GUILayout.Button("Refresh Cache"))
+        private void DrawCoverSelector(float labelWidth)
+        {
+            using (new EditorGUILayout.HorizontalScope())
             {
-                RefreshCacheEntries();
+                using (new EditorGUI.DisabledScope(!CanEditCover()))
+                {
+                    EditorGUILayout.LabelField("Cover", GUILayout.Width(labelWidth));
+                    _coverImagePath = EditorGUILayout.TextField(_coverImagePath, GUILayout.ExpandWidth(true));
+                    if (GUILayout.Button("Pick", GUILayout.Width(48)))
+                    {
+                        var picked = EditorUtility.OpenFilePanel("Pick avatar cover", AvatarBuildCache.CacheDirectory, "png,jpg,jpeg");
+                        if (!string.IsNullOrWhiteSpace(picked))
+                        {
+                            _coverImagePath = picked;
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(string.IsNullOrWhiteSpace(_coverImagePath)))
+                    {
+                        if (GUILayout.Button("Clear", GUILayout.Width(48)))
+                        {
+                            _coverImagePath = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        private void UpdateAvatarInfo(VRC_AvatarDescriptor avatarDescriptor)
+        {
+            if (avatarDescriptor == null)
+            {
+                ClearAvatarSelection();
+                return;
             }
 
-            DrawSubtitle("Cached Bundles");
-            cacheScroll = EditorGUILayout.BeginScrollView(cacheScroll, GUILayout.MinHeight(96), GUILayout.MaxHeight(170));
+            _avatar.SelectDescriptor(avatarDescriptor);
+
+            if (string.IsNullOrWhiteSpace(_newAvatarName))
+                _newAvatarName = _avatar.Root.name;
+
+            if (!_avatar.Root.TryGetComponent<PipelineManager>(out var pipelineManager))
+            {
+                MarkAvatarWithoutPipeline();
+                return;
+            }
+
+            _avatar.SelectPipeline(pipelineManager);
+            if (!_avatar.HasBlueprint)
+            {
+                MarkSelectedAvatarAsNew();
+                return;
+            }
+
+            MarkSelectedAvatarAsExisting();
+        }
+
+        private void ClearAvatarSelection()
+        {
+            _avatar.Clear();
+            _newAvatarName = null;
+            ResetRemoteCheck();
+            ClearInvalidCacheSelection();
+        }
+
+        private void MarkAvatarWithoutPipeline()
+        {
+            _avatar.MarkMissingPipeline();
+            ResetRemoteCheck();
+            ClearInvalidCacheSelection();
+        }
+
+        private void MarkSelectedAvatarAsNew()
+        {
+            _avatar.MarkNewAvatar();
+            ResetRemoteCheck();
+            ClearInvalidCacheSelection();
+        }
+
+        private void MarkSelectedAvatarAsExisting()
+        {
+            _avatar.MarkExistingAvatar();
+            ClearInvalidCacheSelection();
+            if (!string.Equals(_remoteCheck.BlueprintId, _avatar.BlueprintId, StringComparison.Ordinal))
+            {
+                RunRemoteAvatarCheck(_avatar.BlueprintId);
+            }
+        }
+
+        private void ResetRemoteCheck()
+        {
+            _remoteCheck.Reset();
+        }
+
+        private void RunRemoteAvatarCheck(string blueprintId)
+        {
+            var serial = _remoteCheck.Begin(blueprintId);
+            _avatar.IsNewAvatar = false;
+            Repaint();
+
+            _ = RunCheck();
+            return;
+
+            async Task RunCheck()
+            {
+                try
+                {
+                    var avatar = await VRCApi.GetAvatar(blueprintId, forceRefresh: true);
+
+                    if (!IsCurrentRemoteCheck(blueprintId, serial)) return;
+                    if (APIUser.CurrentUser == null)
+                        throw new InvalidOperationException("VRChat user is not logged in.");
+                    if (avatar.AuthorId != APIUser.CurrentUser.id)
+                        throw new InvalidOperationException("Remote avatar belongs to a different user.");
+
+                    _avatar.IsNewAvatar = avatar.PendingUpload;
+                    _remoteCheck.Phase = RemoteAvatarCheckPhase.Ok;
+                }
+                catch (Exception ex)
+                {
+                    if (!IsCurrentRemoteCheck(blueprintId, serial)) return;
+
+                    _avatar.IsNewAvatar = false;
+                    _remoteCheck.Phase = RemoteAvatarCheckPhase.Failed;
+                    _log.Info("Remote avatar check failed: " + ex.Message);
+                }
+                finally
+                {
+                    if (IsCurrentRemoteCheck(blueprintId, serial))
+                    {
+                        Repaint();
+                    }
+                }
+            }
+        }
+
+        private void DrawCacheSection()
+        {
+            DrawTitle("Cache");
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                using (new EditorGUILayout.VerticalScope(GUILayout.ExpandWidth(true)))
+                    DrawCacheListColumn();
+
+                GUILayout.Space(1);
+                using (new EditorGUILayout.VerticalScope())
+                {
+                    GUILayout.Space(2);
+                    DrawVerticalSeparator(166, Color.grey);
+                }
+
+                GUILayout.Space(1);
+                using (new EditorGUILayout.VerticalScope(GUILayout.Width(CacheActionsWidth)))
+                    DrawCacheActionsColumn();
+            }
+        }
+
+        private void DrawCacheListColumn()
+        {
+            var cacheEntries = GetCacheEntriesForSelectedAvatar();
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                DrawSubtitle($"{cacheEntries.Count} / {_allCacheEntries.Count} bundles available");
+                GUILayout.FlexibleSpace();
+
+                if (GUILayout.Button("Open Folder", GUILayout.Width(88)))
+                    OpenCacheFolder();
+                if (GUILayout.Button("Refresh", GUILayout.Width(70)))
+                    RefreshCacheEntries();
+            }
+
+            var listHeight = (EditorGUIUtility.singleLineHeight + 3f) * CacheVisibleRows + 6f;
+            _cacheScroll = EditorGUILayout.BeginScrollView(_cacheScroll, GUILayout.Height(listHeight));
             if (cacheEntries.Count == 0)
             {
-                EditorGUILayout.LabelField("No cached bundles found.", EditorStyles.miniLabel);
+                EditorGUILayout.LabelField("No cache bundles for current avatar.", EditorStyles.miniLabel);
             }
 
             foreach (var entry in cacheEntries)
@@ -205,103 +415,64 @@ namespace Elypha.VRChatUploader
 
         private void DrawCacheEntry(CachedAvatarBundleManifest entry)
         {
-            using (new EditorGUILayout.HorizontalScope())
+            var selected = IsSamePath(_selectedBundlePath, entry.bundlePath);
+            var rowRect = EditorGUILayout.BeginHorizontal();
+            if (Event.current.type == EventType.Repaint && selected)
             {
-                var selected = IsSamePath(selectedBundlePath, entry.bundlePath);
-                var originalColour = GUI.color;
-                if (selected)
-                {
-                    GUI.color = SelectedCacheColour;
-                }
-
-                var label = $"{entry.avatarName} | {entry.platform} | {AvatarFileUtil.FormatBytes(entry.sizeBytes)} | {entry.createdAtLocal}";
-                GUILayout.Label(label, EditorStyles.miniLabel, GUILayout.ExpandWidth(true));
-                GUI.color = originalColour;
-
-                if (GUILayout.Button("Select", GUILayout.Width(56)))
-                {
-                    selectedBundlePath = entry.bundlePath;
-                }
-
-                if (GUILayout.Button("Delete", GUILayout.Width(56)))
-                {
-                    DeleteCacheEntry(entry);
-                }
+                EditorGUI.DrawRect(rowRect, SelectedCacheColour);
             }
+
+            var label = $"{entry.platformLabel,-5}｜{entry.sizeLabel}｜{entry.createdAtLocal}";
+            GUILayout.Label(label, GetCacheEntryLabelStyle(),
+                GUILayout.Height(EditorGUIUtility.singleLineHeight),
+                GUILayout.ExpandWidth(true));
+
+            if (GUILayout.Button("Use", GetCacheEntryButtonStyle(), GUILayout.Width(36)))
+            {
+                _selectedBundlePath = entry.bundlePath;
+            }
+
+            if (GUILayout.Button("X", GetCacheEntryButtonStyle(), GUILayout.Width(16)))
+            {
+                DeleteCacheEntry(entry);
+            }
+
+            EditorGUILayout.EndHorizontal();
         }
 
-        private void DrawUploadSection()
+        private void DrawCacheActionsColumn()
         {
-            DrawTitle("Upload");
+            DrawSubtitle("Settings");
+            _uploadAttempts = DrawIntSliderRow("Attempts", _uploadAttempts, 1, 20, 72f);
+            _retryDelaySeconds = DrawSliderRow("Retry", _retryDelaySeconds, 1f, 60f, 72f);
+            _concurrentWorkers = DrawIntSliderRow("Workers", _concurrentWorkers, 1, MaxWorkerProgressBars, 72f);
+            _concurrentPartSizeMiB = DrawIntSliderRow("Part MiB", _concurrentPartSizeMiB, 8, 100, 72f);
 
-            DrawSubtitle("Shared Settings");
-            uploadAttempts = DrawIntSliderRow("Upload Attempts", uploadAttempts, 1, 20);
-            retryDelaySeconds = DrawSliderRow("Retry Delay", retryDelaySeconds, 1f, 60f);
+            GUILayout.Space(6);
+            var buttonGap = 4f;
+            var buttonWidth = (CacheActionsWidth - buttonGap) / 2f;
+            var buttonHeight = EditorGUIUtility.singleLineHeight * 1.1f;
+            var tallButtonHeight = buttonHeight * 2f;
 
-            DrawSubtitle("Upload Path");
             using (new EditorGUILayout.HorizontalScope())
             {
-                using (new EditorGUILayout.VerticalScope(GUILayout.MinWidth(240)))
+                using (new EditorGUI.DisabledScope(!CanUploadCachedBundle()))
                 {
-                    DrawSubtitle("Concurrent Path");
-                    concurrentWorkers = DrawIntSliderRow("Workers", concurrentWorkers, 1, 8, CompactLabelWidth);
-                    concurrentPartSizeMiB = DrawIntSliderRow("Part Size MiB", concurrentPartSizeMiB, 8, 100, CompactLabelWidth);
-
-                    using (new EditorGUI.DisabledScope(string.IsNullOrWhiteSpace(selectedBundlePath)))
-                    {
-                        if (GUILayout.Button("Upload Cache"))
-                        {
-                            _ = RunExclusive("concurrent-upload-cached", async token =>
-                            {
-                                await CreateWorkflow().UploadCachedConcurrent(token);
-                            });
-                        }
-                    }
-                }
-
-                GUILayout.Space(10);
-
-                using (new EditorGUILayout.VerticalScope(GUILayout.MinWidth(220)))
-                {
-                    DrawSubtitle("Official SDK Path");
-                    DrawReadOnlyRow("Path Settings", "SDK default", CompactLabelWidth);
-
-                    using (new EditorGUI.DisabledScope(string.IsNullOrWhiteSpace(selectedBundlePath)))
-                    {
-                        if (GUILayout.Button("Upload Cache"))
-                        {
-                            _ = RunExclusive("official-upload-cached", async token =>
-                            {
-                                await CreateWorkflow().UploadCachedOfficial(token);
-                            });
-                        }
-                    }
+                    if (GUILayout.Button("Upload\n(Concurrent)", GUILayout.Width(buttonWidth), GUILayout.Height(tallButtonHeight)))
+                        RunConcurrentUploadCached();
+                    if (GUILayout.Button("Upload\n(Official)", GUILayout.Width(buttonWidth), GUILayout.Height(tallButtonHeight)))
+                        RunOfficialUploadCached();
                 }
             }
-        }
-
-        private void DrawCombinedOperationsSection()
-        {
-            DrawTitle("Combined Operations");
 
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Build + Concurrent Upload"))
+                using (new EditorGUI.DisabledScope(!IsAvatarInfoReady()))
                 {
-                    _ = RunExclusive("build-cache-concurrent-upload", async token =>
-                    {
-                        var manifest = await CreateWorkflow().BuildCacheAndUploadConcurrent(token);
-                        selectedBundlePath = manifest.bundlePath;
-                    });
-                }
-
-                if (GUILayout.Button("Build + Official SDK Upload"))
-                {
-                    _ = RunExclusive("build-cache-official-upload", async token =>
-                    {
-                        var manifest = await CreateWorkflow().BuildCacheAndUploadOfficial(token);
-                        selectedBundlePath = manifest.bundlePath;
-                    });
+                    if (GUILayout.Button("Build & ⇧", GUILayout.Width(buttonWidth), GUILayout.Height(buttonHeight)))
+                        RunBuildCacheAndUploadConcurrent();
+                    if (GUILayout.Button("Build & ⇧", GUILayout.Width(buttonWidth), GUILayout.Height(buttonHeight)))
+                        RunBuildCacheAndUploadOfficial();
                 }
             }
         }
@@ -310,27 +481,52 @@ namespace Elypha.VRChatUploader
         {
             DrawTitle("Operation");
 
-            using (new EditorGUI.DisabledScope(!busy))
+            using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Cancel Current Operation"))
+                using (new EditorGUILayout.VerticalScope(GUILayout.ExpandWidth(true)))
                 {
-                    cancellation?.Cancel();
-                    log.Info("Cancellation requested.");
+                    EditorGUILayout.LabelField("Status", _operation.StatusText);
+                    var progressRect = EditorGUILayout.GetControlRect(false, 18);
+                    EditorGUI.ProgressBar(progressRect, _operation.CurrentProgress,
+                        $"{Mathf.RoundToInt(_operation.CurrentProgress * 100f)}%");
+                    DrawWorkerProgressBars();
+                }
+
+                GUILayout.Space(8);
+                using (new EditorGUILayout.VerticalScope(GUILayout.Width(76)))
+                {
+                    GUILayout.Space(EditorGUIUtility.singleLineHeight + 2f);
+                    using (new EditorGUI.DisabledScope(!_operation.Busy))
+                    {
+                        if (GUILayout.Button("Cancel", GUILayout.Height(28)))
+                        {
+                            _operation.Cancellation?.Cancel();
+                            _log.Info("Cancellation requested.");
+                        }
+                    }
                 }
             }
 
-            EditorGUILayout.LabelField("Status", currentStatus);
-            var progressRect = EditorGUILayout.GetControlRect(false, 18);
-            EditorGUI.ProgressBar(progressRect, currentProgress, $"{Mathf.RoundToInt(currentProgress * 100f)}%");
-
             DrawSubtitle("Log");
-            logScroll = EditorGUILayout.BeginScrollView(logScroll, GUILayout.MinHeight(160));
-            foreach (var line in log.Lines)
+            _logScroll = EditorGUILayout.BeginScrollView(_logScroll, GUILayout.MinHeight(160));
+            foreach (var line in _log.Lines)
             {
                 EditorGUILayout.LabelField(line, EditorStyles.wordWrappedLabel);
             }
 
             EditorGUILayout.EndScrollView();
+        }
+
+        private void DrawWorkerProgressBars()
+        {
+            for (var i = 0; i < _operation.ActiveWorkerProgressBars; i++)
+            {
+                var progressRect = EditorGUILayout.GetControlRect(false, 16);
+                var status = string.IsNullOrWhiteSpace(_operation.WorkerStatusText[i])
+                    ? $"Worker {i + 1}"
+                    : $"Worker {i + 1}: {_operation.WorkerStatusText[i]}";
+                EditorGUI.ProgressBar(progressRect, _operation.WorkerProgress[i], status);
+            }
         }
 
         private void DeleteCacheEntry(CachedAvatarBundleManifest entry)
@@ -344,60 +540,97 @@ namespace Elypha.VRChatUploader
             try
             {
                 AvatarBuildCache.Delete(entry);
-                if (IsSamePath(selectedBundlePath, entry.bundlePath))
+                if (IsSamePath(_selectedBundlePath, entry.bundlePath))
                 {
-                    selectedBundlePath = "";
+                    _selectedBundlePath = "";
                 }
 
-                log.Info("Deleted cached bundle: " + entry.bundlePath);
+                _log.Info("Deleted cached bundle: " + entry.bundlePath);
                 RefreshCacheEntries();
             }
             catch (Exception ex)
             {
-                log.Info("Failed to delete cached bundle: " + ex.Message);
+                _log.Info("Failed to delete cached bundle: " + ex.Message);
                 Debug.LogException(ex);
             }
         }
 
-        private async Task RunExclusive(string operationName, Func<CancellationToken, Task> operation)
-        {
-            if (busy)
+        private void RunBuildCache() =>
+            _ = RunExclusive("build-cache", BuildCacheProgressStages, 0, async token =>
             {
-                log.Info("Another operation is already running.");
+                var manifest = await CreateWorkflow().BuildCache(token);
+                UpdateAvatarInfo(_avatar.Descriptor);
+                _selectedBundlePath = manifest.bundlePath;
+            });
+
+        private void RunConcurrentUploadCached() =>
+            _ = RunExclusive("concurrent-upload-cached", UploadProgressStages, GetConcurrentWorkerBars(),
+                async token => { await CreateWorkflow().UploadCachedConcurrent(token); });
+
+        private void RunOfficialUploadCached() =>
+            _ = RunExclusive("official-upload-cached", UploadProgressStages, 0,
+                async token => { await CreateWorkflow().UploadCachedOfficial(token); });
+
+        private void RunBuildCacheAndUploadConcurrent() =>
+            _ = RunExclusive("build-cache-concurrent-upload", BuildUploadProgressStages, GetConcurrentWorkerBars(),
+                async token =>
+                {
+                    var manifest = await CreateWorkflow().BuildCacheAndUploadConcurrent(token);
+                    UpdateAvatarInfo(_avatar.Descriptor);
+                    _selectedBundlePath = manifest.bundlePath;
+                });
+
+        private void RunBuildCacheAndUploadOfficial() =>
+            _ = RunExclusive("build-cache-official-upload", BuildUploadProgressStages, 0,
+                async token =>
+                {
+                    var manifest = await CreateWorkflow().BuildCacheAndUploadOfficial(token);
+                    UpdateAvatarInfo(_avatar.Descriptor);
+                    _selectedBundlePath = manifest.bundlePath;
+                });
+
+        private async Task RunExclusive(
+            string operationName,
+            AvatarUploadProgressStage[] progressStages,
+            int workerBars,
+            Func<CancellationToken, Task> operation)
+        {
+            if (_operation.Busy)
+            {
+                _log.Info("Another operation is already running.");
                 return;
             }
 
-            busy = true;
-            currentProgress = 0f;
-            currentStatus = "Starting";
-            cancellation = new CancellationTokenSource();
-            log.Begin(operationName);
+            _operation.Busy = true;
+            _operation.Begin(progressStages, workerBars);
+            _operation.Cancellation = new CancellationTokenSource();
+            _log.Begin(operationName);
 
             var watch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                await operation(cancellation.Token);
+                await operation(_operation.Cancellation.Token);
                 SetProgress("Done", 1f);
             }
             catch (OperationCanceledException)
             {
-                log.Info("Operation cancelled.");
+                _log.Info("Operation cancelled.");
                 SetProgress("Cancelled", 0f);
             }
             catch (Exception ex)
             {
-                log.Info("Failed: " + ex.Message);
+                _log.Info("Failed: " + ex.Message);
                 Debug.LogException(ex);
                 SetProgress("Failed", 0f);
             }
             finally
             {
                 watch.Stop();
-                log.Info($"Operation finished after {watch.Elapsed.TotalSeconds:F2}s.");
-                log.End();
-                cancellation.Dispose();
-                cancellation = null;
-                busy = false;
+                _log.Info($"Operation finished after {watch.Elapsed.TotalSeconds:F2}s.");
+                _log.End();
+                _operation.Cancellation.Dispose();
+                _operation.Cancellation = null;
+                _operation.Busy = false;
                 EditorUtility.ClearProgressBar();
                 RefreshCacheEntries();
                 Repaint();
@@ -408,84 +641,154 @@ namespace Elypha.VRChatUploader
         {
             return new AvatarUploadWorkflow(new AvatarUploadRequest
             {
-                AvatarRoot = avatarRoot,
-                NewAvatarName = newAvatarName,
-                NewAvatarDescription = newAvatarDescription,
-                NewAvatarReleaseStatus = newAvatarReleaseStatus,
-                CoverImagePath = coverImagePath,
-                CachedBundlePath = selectedBundlePath,
-                UploadAttempts = uploadAttempts,
-                RetryDelaySeconds = retryDelaySeconds,
-                ConcurrentWorkers = concurrentWorkers,
-                ConcurrentPartSizeMiB = concurrentPartSizeMiB
-            }, log.Info, SetProgressSafe);
+                AvatarRoot = _avatar.Root,
+                NewAvatarName = _newAvatarName,
+                NewAvatarReleaseStatus = _newAvatarReleaseStatus,
+                CoverImagePath = _coverImagePath,
+                CachedBundlePath = _selectedBundlePath,
+                UploadAttempts = _uploadAttempts,
+                RetryDelaySeconds = _retryDelaySeconds,
+                ConcurrentWorkers = _concurrentWorkers,
+                ConcurrentPartSizeMiB = _concurrentPartSizeMiB
+            }, _log.Info, SetProgressSafe, SetWorkerProgressSafe);
         }
 
         private void RefreshCacheEntries()
         {
-            cacheEntries = AvatarBuildCache.ListRecent();
+            _allCacheEntries = AvatarBuildCache.ListRecent();
+            ClearInvalidCacheSelection();
             Repaint();
         }
 
-        private void SetProgressSafe(string status, float percentage)
+        private void SetProgressSafe(AvatarUploadProgressStage stage, string status, float percentage)
         {
-            currentStatus = status;
-            currentProgress = Mathf.Clamp01(percentage);
+            _operation.SetStageProgress(stage, status, percentage);
             EditorApplication.delayCall += () =>
             {
-                if (this == null || !busy)
-                {
-                    return;
-                }
+                if (this == null || !_operation.Busy) return;
 
-                EditorUtility.DisplayProgressBar(WindowTitle, currentStatus, currentProgress);
+                EditorUtility.DisplayProgressBar(WindowTitle, _operation.StatusText, _operation.CurrentProgress);
+                Repaint();
+            };
+        }
+
+        private void SetWorkerProgressSafe(int workerIndex, string status, float percentage)
+        {
+            if (!_operation.SetWorkerProgress(workerIndex, status, percentage)) return;
+
+            EditorApplication.delayCall += () =>
+            {
+                if (this == null || !_operation.Busy) return;
+
                 Repaint();
             };
         }
 
         private void SetProgress(string status, float percentage)
         {
-            currentStatus = status;
-            currentProgress = Mathf.Clamp01(percentage);
-            EditorUtility.DisplayProgressBar(WindowTitle, currentStatus, currentProgress);
+            _operation.SetProgress(status, percentage);
+            EditorUtility.DisplayProgressBar(WindowTitle, _operation.StatusText, _operation.CurrentProgress);
             Repaint();
         }
 
-        private static string DrawTextRow(string label, string value, float labelWidth = LabelWidth)
+        private int GetConcurrentWorkerBars() => _concurrentWorkers > 1
+            ? Mathf.Clamp(_concurrentWorkers, 0, MaxWorkerProgressBars)
+            : 0;
+
+        private List<CachedAvatarBundleManifest> GetCacheEntriesForSelectedAvatar()
         {
-            using (new EditorGUILayout.HorizontalScope())
+            if (string.IsNullOrWhiteSpace(_avatar.BlueprintId))
             {
-                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
-                return EditorGUILayout.TextField(value);
+                return new List<CachedAvatarBundleManifest>();
+            }
+
+            return _allCacheEntries
+                .Where(entry => string.Equals(entry.avatarId, _avatar.BlueprintId, StringComparison.Ordinal))
+                .ToList();
+        }
+
+        private void ClearInvalidCacheSelection()
+        {
+            if (!GetCacheEntriesForSelectedAvatar().Any(entry => IsSamePath(entry.bundlePath, _selectedBundlePath)))
+            {
+                _selectedBundlePath = "";
             }
         }
 
-        private static int DrawIntSliderRow(string label, int value, int leftValue, int rightValue, float labelWidth = LabelWidth)
+        private static void OpenCacheFolder()
         {
-            using (new EditorGUILayout.HorizontalScope())
+            Directory.CreateDirectory(AvatarBuildCache.CacheDirectory);
+            EditorUtility.RevealInFinder(AvatarBuildCache.CacheDirectory);
+        }
+
+        // semantic status
+        // --------------------------------
+        private bool IsBundlePathSelected() => !string.IsNullOrWhiteSpace(_selectedBundlePath);
+        private bool CanEditCover() => _avatar.HasPipeline && _remoteCheck.IsReady && _avatar.IsNewAvatar;
+
+        private bool IsAvatarInfoReady() =>
+            _avatar.HasPipeline
+            && _remoteCheck.IsReady
+            && (_remoteCheck.Phase != RemoteAvatarCheckPhase.NotNeeded || !string.IsNullOrWhiteSpace(_newAvatarName))
+            && (!_avatar.IsNewAvatar || !string.IsNullOrWhiteSpace(_coverImagePath));
+
+        private bool CanUploadCachedBundle() =>
+            IsAvatarInfoReady()
+            && _remoteCheck.Phase != RemoteAvatarCheckPhase.NotNeeded
+            && IsBundlePathSelected();
+
+        private bool IsCurrentRemoteCheck(string blueprintId, int serial) =>
+            _remoteCheck.IsCurrent(blueprintId, serial);
+
+        private bool CanRetryRemoteCheck() =>
+            _remoteCheck.CanRetry;
+
+        // function helper
+        // --------------------------------
+        private static bool TryGetAvatarDescriptorInParents(GameObject obj, out VRC_AvatarDescriptor avatarDescriptor)
+        {
+            avatarDescriptor = obj.GetComponentInParent<VRC_AvatarDescriptor>(true);
+            return avatarDescriptor != null;
+        }
+
+        private static bool IsSamePath(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+
+            try
             {
-                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
-                return EditorGUILayout.IntSlider(value, leftValue, rightValue);
+                return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
             }
         }
 
-        private static float DrawSliderRow(string label, float value, float leftValue, float rightValue, float labelWidth = LabelWidth)
+        // UI helper
+        // --------------------------------
+        private static float CalculateLabelWidth(params string[] labels)
         {
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
-                return EditorGUILayout.Slider(value, leftValue, rightValue);
-            }
+            var width = labels.Aggregate(0f,
+                (current, label) => Mathf.Max(current, EditorStyles.label.CalcSize(new GUIContent(label)).x));
+
+            return Mathf.Ceil(width + 8f);
         }
 
-        private static void DrawReadOnlyRow(string label, string value, float labelWidth = LabelWidth)
+        private static void DrawSeparator()
         {
-            using (new EditorGUILayout.HorizontalScope())
-            using (new EditorGUI.DisabledScope(true))
-            {
-                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
-                EditorGUILayout.TextField(value);
-            }
+            var rect = EditorGUILayout.GetControlRect(false, 5);
+            rect.height = 1;
+            rect.y += 1;
+            rect.x -= 2;
+            rect.width += 6;
+            EditorGUI.DrawRect(rect, Color.grey);
+        }
+
+        private static void DrawVerticalSeparator(float height, Color colour)
+        {
+            var rect = GUILayoutUtility.GetRect(1f, height, GUILayout.Width(1f), GUILayout.Height(height));
+            EditorGUI.DrawRect(rect, colour);
         }
 
         private static void DrawTitle(string title, float spacePixels = 8)
@@ -504,36 +807,65 @@ namespace Elypha.VRChatUploader
         {
             var style = new GUIStyle(EditorStyles.boldLabel)
             {
-                normal = {textColor = colour}
+                normal = { textColor = colour }
             };
 
             EditorGUILayout.LabelField(label, style, GUILayout.MinWidth(32), GUILayout.MaxWidth(500), GUILayout.ExpandWidth(true));
         }
 
-        private static void DrawSeparator()
+        private static GUIStyle GetCacheEntryLabelStyle()
         {
-            var rect = EditorGUILayout.GetControlRect(false, 5);
-            rect.height = 1;
-            rect.y += 1;
-            rect.x -= 2;
-            rect.width += 6;
-            EditorGUI.DrawRect(rect, Color.grey);
+            if (_cacheEntryLabelStyle != null) return _cacheEntryLabelStyle;
+
+            _cacheEntryLabelStyle = new GUIStyle(EditorStyles.miniLabel)
+            {
+                font = Font.CreateDynamicFontFromOSFont(
+                    new[] { "Consolas", "Courier New", "Menlo", "Monaco" },
+                    12),
+                fontSize = 12,
+                alignment = TextAnchor.MiddleLeft
+            };
+            return _cacheEntryLabelStyle;
         }
 
-        private static bool IsSamePath(string left, string right)
+        private static GUIStyle GetCacheEntryButtonStyle()
         {
-            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
-            {
-                return false;
-            }
+            if (_cacheEntryButtonStyle != null) return _cacheEntryButtonStyle;
 
-            try
+            _cacheEntryButtonStyle = new GUIStyle(GUI.skin.button)
             {
-                return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+                alignment = TextAnchor.MiddleCenter,
+                padding = new RectOffset(3, 1, 2, 2)
+            };
+            return _cacheEntryButtonStyle;
+        }
+
+        private static string DrawTextRow(string label, string value, float labelWidth = LabelWidth)
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
+                return EditorGUILayout.TextField(value, GUILayout.ExpandWidth(true));
             }
-            catch
+        }
+
+        private static int DrawIntSliderRow(string label, int value, int leftValue, int rightValue,
+            float labelWidth = LabelWidth)
+        {
+            using (new EditorGUILayout.HorizontalScope())
             {
-                return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
+                return EditorGUILayout.IntSlider(value, leftValue, rightValue);
+            }
+        }
+
+        private static float DrawSliderRow(string label, float value, float leftValue, float rightValue,
+            float labelWidth = LabelWidth)
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField(label, GUILayout.Width(labelWidth));
+                return EditorGUILayout.Slider(value, leftValue, rightValue);
             }
         }
     }

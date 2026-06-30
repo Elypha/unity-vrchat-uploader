@@ -19,8 +19,6 @@ namespace Elypha.VRChatUploader
         public string PreparedThumbnailPath;
         public string ImageUrl;
 
-        public string AvatarName => string.IsNullOrWhiteSpace(Avatar.Name) ? AvatarId : Avatar.Name;
-
         public static AvatarUploadContext ForExisting(PipelineManager pipelineManager, VRCAvatar avatar)
         {
             return new AvatarUploadContext
@@ -61,7 +59,6 @@ namespace Elypha.VRChatUploader
             if (FirstTimeUpload)
             {
                 request["name"] = Avatar.Name;
-                request["description"] = Avatar.Description ?? "";
                 request["tags"] = Avatar.Tags ?? new List<string>();
                 request["releaseStatus"] = string.IsNullOrWhiteSpace(Avatar.ReleaseStatus) ? "private" : Avatar.ReleaseStatus;
                 if (!string.IsNullOrWhiteSpace(ImageUrl))

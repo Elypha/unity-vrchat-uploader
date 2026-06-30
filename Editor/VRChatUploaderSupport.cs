@@ -7,6 +7,18 @@ using System.Threading.Tasks;
 
 namespace Elypha.VRChatUploader
 {
+    internal enum AvatarUploadProgressStage
+    {
+        Prepare,
+        Build,
+        Upload,
+        Finalize,
+        Verify
+    }
+
+    internal delegate void AvatarUploadProgressHandler(AvatarUploadProgressStage stage, string status, float percentage);
+    internal delegate void AvatarUploadWorkerProgressHandler(int workerIndex, string status, float percentage);
+
     internal sealed class VRChatUploaderLog
     {
         private readonly List<string> lines = new();

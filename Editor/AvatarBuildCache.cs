@@ -36,7 +36,6 @@ namespace Elypha.VRChatUploader
             var manifest = new CachedAvatarBundleManifest
             {
                 avatarId = context.AvatarId,
-                avatarName = context.AvatarName,
                 platform = VRC.Tools.Platform,
                 unityVersion = Application.unityVersion,
                 sdkVersion = VRC.Tools.SdkVersion,
@@ -45,6 +44,7 @@ namespace Elypha.VRChatUploader
                 md5Base64 = AvatarFileUtil.ComputeMd5Base64(cachePath),
                 createdAtLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
             };
+            ApplyLabels(manifest);
 
             File.WriteAllText(ManifestPathForBundle(cachePath), JsonUtility.ToJson(manifest, true));
             return manifest;
@@ -149,7 +149,9 @@ namespace Elypha.VRChatUploader
                     return null;
                 }
 
-                return JsonUtility.FromJson<CachedAvatarBundleManifest>(File.ReadAllText(manifestPath));
+                var manifest = JsonUtility.FromJson<CachedAvatarBundleManifest>(File.ReadAllText(manifestPath));
+                ApplyLabels(manifest);
+                return manifest;
             }
             catch
             {
@@ -175,13 +177,52 @@ namespace Elypha.VRChatUploader
                 throw new InvalidOperationException("Refusing to delete a bundle outside the uploader cache: " + path);
             }
         }
+
+        private static void ApplyLabels(CachedAvatarBundleManifest manifest)
+        {
+            if (manifest == null)
+            {
+                return;
+            }
+
+            manifest.platformLabel = CreatePlatformLabel(manifest.platform);
+            manifest.sizeLabel = CreateSizeLabel(manifest.sizeBytes);
+        }
+
+        private static string CreatePlatformLabel(string platform)
+        {
+            if (string.Equals(platform, "standalonewindows", StringComparison.OrdinalIgnoreCase))
+            {
+                return "PC";
+            }
+
+            if (string.Equals(platform, "android", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Quest";
+            }
+
+            return platform;
+        }
+
+        private static string CreateSizeLabel(long sizeBytes)
+        {
+            string[] units = { "B", "KB", "MB", "GB" };
+            var value = (double)sizeBytes;
+            var unit = 0;
+            while (value >= 1024 && unit < units.Length - 1)
+            {
+                value /= 1024;
+                unit++;
+            }
+
+            return $"{value,6:F2} {units[unit]}";
+        }
     }
 
     [Serializable]
     internal sealed class CachedAvatarBundleManifest
     {
         public string avatarId;
-        public string avatarName;
         public string platform;
         public string unityVersion;
         public string sdkVersion;
@@ -189,5 +230,7 @@ namespace Elypha.VRChatUploader
         public long sizeBytes;
         public string md5Base64;
         public string createdAtLocal;
+        [NonSerialized] public string platformLabel;
+        [NonSerialized] public string sizeLabel;
     }
 }
