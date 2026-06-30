@@ -16,6 +16,7 @@ namespace Elypha.VRChatUploader
         public VRCAvatar Avatar;
         public bool FirstTimeUpload;
         public bool ReservedDuringOperation;
+        public bool CopyrightAgreementAccepted;
         public string PreparedThumbnailPath;
         public string ImageUrl;
 

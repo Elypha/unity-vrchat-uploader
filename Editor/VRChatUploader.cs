@@ -619,7 +619,7 @@ namespace Elypha.VRChatUploader
             }
             catch (Exception ex)
             {
-                _log.Info("Failed: " + ex.Message);
+                _log.Info("Failed: " + FormatException(ex));
                 Debug.LogException(ex);
                 SetProgress("Failed", 0f);
             }
@@ -767,6 +767,13 @@ namespace Elypha.VRChatUploader
             {
                 return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
             }
+        }
+
+        private static string FormatException(Exception ex)
+        {
+            return ex is ApiErrorException apiError
+                ? $"VRChat API error {apiError.StatusCode}: {apiError.ErrorMessage}"
+                : ex.Message;
         }
 
         // UI helper

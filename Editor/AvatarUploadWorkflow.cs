@@ -74,6 +74,7 @@ namespace Elypha.VRChatUploader
             var context = await PrepareAvatarContext(needsUpload: true, token);
             try
             {
+                await EnsureCopyrightAgreement(context, token);
                 var manifest = await BuildAndCache(context, token);
                 await UploadCachedConcurrent(context, manifest, token);
                 return manifest;
@@ -90,6 +91,7 @@ namespace Elypha.VRChatUploader
             var context = await PrepareAvatarContext(needsUpload: true, token);
             try
             {
+                await EnsureCopyrightAgreement(context, token);
                 var manifest = await BuildAndCache(context, token);
                 await UploadCachedOfficial(context, manifest, token);
                 return manifest;
@@ -155,7 +157,7 @@ namespace Elypha.VRChatUploader
                 }
                 catch (Exception ex) when (!token.IsCancellationRequested && attempt < request.UploadAttempts)
                 {
-                    log($"Official upload attempt {attempt} failed: {ex.Message}");
+                    log($"Official upload attempt {attempt} failed: {FormatException(ex)}");
                     await Task.Delay(TimeSpan.FromSeconds(request.RetryDelaySeconds), token);
                 }
             }
@@ -266,22 +268,7 @@ namespace Elypha.VRChatUploader
             }
             catch
             {
-                if (context.ReservedDuringOperation)
-                {
-                    log("Build failed after reserving a new avatar ID; deleting the pending avatar record.");
-                    try
-                    {
-                        await VRCApi.DeleteAvatar(context.AvatarId);
-                        Undo.RecordObject(context.PipelineManager, "Clearing avatar blueprint ID after failed build");
-                        context.PipelineManager.blueprintId = "";
-                        EditorUtility.SetDirty(context.PipelineManager);
-                    }
-                    catch (Exception ex) when (!token.IsCancellationRequested)
-                    {
-                        log("Failed to clean up reserved avatar ID: " + ex.Message);
-                    }
-                }
-
+                await CleanupReservedAvatarAfterFailure(context, "Build failed after reserving a new avatar ID");
                 throw;
             }
         }
@@ -324,7 +311,7 @@ namespace Elypha.VRChatUploader
                 catch (Exception ex) when (!token.IsCancellationRequested)
                 {
                     lastError = ex;
-                    log($"Concurrent upload attempt {attempt} failed: {ex.Message}");
+                    log($"Concurrent upload attempt {attempt} failed: {FormatException(ex)}");
 
                     if (AvatarUploadProtocol.IsAlreadyUploadedError(ex) &&
                         await TryFinalizeCompletedBundleVersion(context, manifest.md5Base64, token))
@@ -443,6 +430,10 @@ namespace Elypha.VRChatUploader
         private async Task EnsureCopyrightAgreement(AvatarUploadContext context, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
+            if (context.CopyrightAgreementAccepted)
+            {
+                return;
+            }
 
             log("Auto-accepting copyright ownership agreement for " + context.AvatarId + ".");
             var result = await VRCApi.ContentUploadConsent(new VRCAgreement
@@ -460,10 +451,16 @@ namespace Elypha.VRChatUploader
                 throw new OwnershipException("Failed to accept copyright ownership agreement.");
             }
 
+            context.CopyrightAgreementAccepted = true;
             log($"Copyright agreement accepted. contentId={context.AvatarId}, sdk={VRC.Tools.SdkVersion}.");
         }
 
         private async Task CleanupReservedAvatarAfterFailure(AvatarUploadContext context)
+        {
+            await CleanupReservedAvatarAfterFailure(context, "First upload failed after reserving a new avatar ID");
+        }
+
+        private async Task CleanupReservedAvatarAfterFailure(AvatarUploadContext context, string reason)
         {
             if (!context.ReservedDuringOperation ||
                 !string.Equals(context.PipelineManager.blueprintId, context.AvatarId, StringComparison.Ordinal))
@@ -471,17 +468,22 @@ namespace Elypha.VRChatUploader
                 return;
             }
 
-            log("First upload failed after reserving a new avatar ID; deleting the pending avatar record.");
+            log(reason + "; deleting the pending avatar record.");
             try
             {
                 await VRCApi.DeleteAvatar(context.AvatarId);
-                Undo.RecordObject(context.PipelineManager, "Clearing avatar blueprint ID after failed first upload");
-                context.PipelineManager.blueprintId = "";
-                EditorUtility.SetDirty(context.PipelineManager);
+                log("Deleted pending avatar record " + context.AvatarId + ".");
             }
             catch (Exception ex)
             {
-                log("Failed to clean up reserved avatar ID: " + ex.Message);
+                log("Failed to clean up reserved avatar ID: " + FormatException(ex));
+            }
+            finally
+            {
+                Undo.RecordObject(context.PipelineManager, "Clearing avatar blueprint ID after failed first upload");
+                context.PipelineManager.blueprintId = "";
+                EditorUtility.SetDirty(context.PipelineManager);
+                log("PipelineManager blueprint ID cleared for failed first upload.");
             }
         }
 
@@ -568,6 +570,13 @@ namespace Elypha.VRChatUploader
         private static string NormalizeReleaseStatus(string value)
         {
             return Array.IndexOf(ReleaseStatusOptions, value) >= 0 ? value : "private";
+        }
+
+        private static string FormatException(Exception ex)
+        {
+            return ex is ApiErrorException apiError
+                ? $"VRChat API error {apiError.StatusCode}: {apiError.ErrorMessage}"
+                : ex.Message;
         }
     }
 }
