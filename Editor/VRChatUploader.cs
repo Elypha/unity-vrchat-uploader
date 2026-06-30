@@ -174,7 +174,7 @@ namespace Elypha.VRChatUploader
                     }
 
                     GUILayout.Space(4);
-                    using (new EditorGUI.DisabledScope(!IsAvatarInfoReady()))
+                    using (new EditorGUI.DisabledScope(!CanBuildCache()))
                     {
                         if (GUILayout.Button("Build", GUILayout.Height(58)))
                         {
@@ -726,11 +726,15 @@ namespace Elypha.VRChatUploader
         private bool IsBundlePathSelected() => !string.IsNullOrWhiteSpace(_selectedBundlePath);
         private bool CanEditCover() => _avatar.HasPipeline && _remoteCheck.IsReady && _avatar.IsNewAvatar;
 
+        private bool CanBuildCache() =>
+            IsAvatarInfoReady()
+            && _avatar.HasBlueprint
+            && !_avatar.IsNewAvatar;
+
         private bool IsAvatarInfoReady() =>
             _avatar.HasPipeline
             && _remoteCheck.IsReady
-            && (_remoteCheck.Phase != RemoteAvatarCheckPhase.NotNeeded || !string.IsNullOrWhiteSpace(_newAvatarName))
-            && (!_avatar.IsNewAvatar || !string.IsNullOrWhiteSpace(_coverImagePath));
+            && (!_avatar.IsNewAvatar || (!string.IsNullOrWhiteSpace(_newAvatarName) && !string.IsNullOrWhiteSpace(_coverImagePath)));
 
         private bool CanUploadCachedBundle() =>
             IsAvatarInfoReady()

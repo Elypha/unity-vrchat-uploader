@@ -46,7 +46,18 @@ namespace Elypha.VRChatUploader
 
         public async Task<CachedAvatarBundleManifest> BuildCache(CancellationToken token)
         {
+            var pipelineManager = ValidateAvatarRoot();
+            if (string.IsNullOrWhiteSpace(pipelineManager.blueprintId))
+            {
+                throw new InvalidOperationException("New avatars must use Build & Upload for the first upload; cache-only build would leave a pending remote avatar record.");
+            }
+
             var context = await PrepareAvatarContext(needsUpload: false, token);
+            if (context.FirstTimeUpload)
+            {
+                throw new InvalidOperationException("Pending first-upload avatars must use Build & Upload; cache-only build would leave the remote avatar record incomplete.");
+            }
+
             return await BuildAndCache(context, token);
         }
 
@@ -61,17 +72,33 @@ namespace Elypha.VRChatUploader
         public async Task<CachedAvatarBundleManifest> BuildCacheAndUploadConcurrent(CancellationToken token)
         {
             var context = await PrepareAvatarContext(needsUpload: true, token);
-            var manifest = await BuildAndCache(context, token);
-            await UploadCachedConcurrent(context, manifest, token);
-            return manifest;
+            try
+            {
+                var manifest = await BuildAndCache(context, token);
+                await UploadCachedConcurrent(context, manifest, token);
+                return manifest;
+            }
+            catch
+            {
+                await CleanupReservedAvatarAfterFailure(context);
+                throw;
+            }
         }
 
         public async Task<CachedAvatarBundleManifest> BuildCacheAndUploadOfficial(CancellationToken token)
         {
             var context = await PrepareAvatarContext(needsUpload: true, token);
-            var manifest = await BuildAndCache(context, token);
-            await UploadCachedOfficial(context, manifest, token);
-            return manifest;
+            try
+            {
+                var manifest = await BuildAndCache(context, token);
+                await UploadCachedOfficial(context, manifest, token);
+                return manifest;
+            }
+            catch
+            {
+                await CleanupReservedAvatarAfterFailure(context);
+                throw;
+            }
         }
 
         public async Task UploadCachedOfficial(CancellationToken token)
@@ -152,15 +179,7 @@ namespace Elypha.VRChatUploader
 
             if (string.IsNullOrWhiteSpace(pipelineManager.blueprintId))
             {
-                var name = string.IsNullOrWhiteSpace(request.NewAvatarName) && request.AvatarRoot != null
-                    ? request.AvatarRoot.name
-                    : request.NewAvatarName;
-                name = (name ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(name))
-                {
-                    throw new InvalidOperationException("Avatar name cannot be empty for a new avatar.");
-                }
-
+                var name = ResolveNewAvatarName();
                 var thumbnailPath = "";
                 if (needsUpload)
                 {
@@ -172,25 +191,21 @@ namespace Elypha.VRChatUploader
                     thumbnailPath = request.CoverImagePath;
                 }
 
-                var avatar = new VRCAvatar
-                {
-                    Name = name,
-                    Description = "",
-                    ReleaseStatus = NormalizeReleaseStatus(request.NewAvatarReleaseStatus),
-                    Tags = new List<string>()
-                };
+                var avatar = CreateFirstUploadAvatar(name);
 
                 log($"Reserving new avatar ID for \"{avatar.Name}\".");
                 progress(AvatarUploadProgressStage.Prepare, "Reserving avatar ID", 0.25f);
-                avatar = await VRCApi.CreateAvatarRecord(avatar, ProgressForStage(AvatarUploadProgressStage.Prepare), token);
-                if (string.IsNullOrWhiteSpace(avatar.ID))
+                var createdAvatar = await VRCApi.CreateAvatarRecord(avatar, ProgressForStage(AvatarUploadProgressStage.Prepare), token);
+                if (string.IsNullOrWhiteSpace(createdAvatar.ID))
                 {
                     throw new UploadException("Failed to reserve a new avatar ID.");
                 }
 
                 Undo.RecordObject(pipelineManager, "Assigning avatar blueprint ID");
-                pipelineManager.blueprintId = avatar.ID;
+                pipelineManager.blueprintId = createdAvatar.ID;
                 EditorUtility.SetDirty(pipelineManager);
+
+                avatar = ApplyFirstUploadMetadata(createdAvatar, avatar);
 
                 log($"Reserved avatar ID {avatar.ID}; PipelineManager blueprint ID updated.");
                 return AvatarUploadContext.ForPending(pipelineManager, avatar, thumbnailPath, reservedDuringOperation: true);
@@ -225,7 +240,8 @@ namespace Elypha.VRChatUploader
                 pendingThumbnailPath = request.CoverImagePath;
             }
 
-            return AvatarUploadContext.ForPending(pipelineManager, remoteAvatar, pendingThumbnailPath, reservedDuringOperation: false);
+            var pendingAvatar = ApplyFirstUploadMetadata(remoteAvatar, CreateFirstUploadAvatar());
+            return AvatarUploadContext.ForPending(pipelineManager, pendingAvatar, pendingThumbnailPath, reservedDuringOperation: false);
         }
 
         private async Task<CachedAvatarBundleManifest> BuildAndCache(AvatarUploadContext context, CancellationToken token)
@@ -445,6 +461,68 @@ namespace Elypha.VRChatUploader
             }
 
             log($"Copyright agreement accepted. contentId={context.AvatarId}, sdk={VRC.Tools.SdkVersion}.");
+        }
+
+        private async Task CleanupReservedAvatarAfterFailure(AvatarUploadContext context)
+        {
+            if (!context.ReservedDuringOperation ||
+                !string.Equals(context.PipelineManager.blueprintId, context.AvatarId, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            log("First upload failed after reserving a new avatar ID; deleting the pending avatar record.");
+            try
+            {
+                await VRCApi.DeleteAvatar(context.AvatarId);
+                Undo.RecordObject(context.PipelineManager, "Clearing avatar blueprint ID after failed first upload");
+                context.PipelineManager.blueprintId = "";
+                EditorUtility.SetDirty(context.PipelineManager);
+            }
+            catch (Exception ex)
+            {
+                log("Failed to clean up reserved avatar ID: " + ex.Message);
+            }
+        }
+
+        private VRCAvatar CreateFirstUploadAvatar(string name = null)
+        {
+            name = string.IsNullOrWhiteSpace(name)
+                ? ResolveNewAvatarName()
+                : name.Trim();
+
+            return new VRCAvatar
+            {
+                Name = name,
+                Description = "",
+                ReleaseStatus = NormalizeReleaseStatus(request.NewAvatarReleaseStatus),
+                Tags = new List<string>()
+            };
+        }
+
+        private string ResolveNewAvatarName()
+        {
+            var name = string.IsNullOrWhiteSpace(request.NewAvatarName) && request.AvatarRoot != null
+                ? request.AvatarRoot.name
+                : request.NewAvatarName;
+
+            name = (name ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new InvalidOperationException("Avatar name cannot be empty for a new avatar.");
+            }
+
+            return name;
+        }
+
+        private static VRCAvatar ApplyFirstUploadMetadata(VRCAvatar avatar, VRCAvatar metadata)
+        {
+            avatar.Name = metadata.Name;
+            avatar.Description = metadata.Description ?? "";
+            avatar.ReleaseStatus = NormalizeReleaseStatus(metadata.ReleaseStatus);
+            avatar.Tags = metadata.Tags ?? new List<string>();
+            avatar.Styles = metadata.Styles;
+            return avatar;
         }
 
         private PipelineManager ValidateAvatarRoot()
