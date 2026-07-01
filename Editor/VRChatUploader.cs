@@ -56,6 +56,7 @@ namespace Elypha.VRChatUploader
 
         private static GUIStyle _cacheEntryLabelStyle;
         private static GUIStyle _cacheEntryButtonStyle;
+        private static GUIStyle _avatarActionButtonStyle;
 
         [SerializeField] private string _newAvatarReleaseStatus = "private";
         [SerializeField] private int _uploadAttempts = DefaultAttempts;
@@ -146,16 +147,36 @@ namespace Elypha.VRChatUploader
                 }
 
                 GUILayout.Space(1);
-                using (new EditorGUILayout.VerticalScope())
+                DrawAvatarActions();
+            }
+        }
+
+        private void DrawAvatarActions()
+        {
+            const float separatorWidth = 1f;
+            const float buttonGap = 4f;
+            const float buttonWidth = 80f;
+            const float topPadding = 2f;
+            const float retryButtonHeight = 20f;
+            const float verticalGap = 2f;
+            const float buildButtonHeight = 38f;
+            const float height = topPadding + retryButtonHeight + verticalGap + buildButtonHeight;
+            var columnWidth = buttonWidth + GUI.skin.button.margin.right;
+
+            using (new EditorGUILayout.HorizontalScope(
+                       GUILayout.Width(separatorWidth + buttonGap + columnWidth),
+                       GUILayout.Height(height)))
+            {
+                using (new EditorGUILayout.VerticalScope(GUILayout.Width(separatorWidth), GUILayout.Height(height)))
                 {
-                    GUILayout.Space(2);
-                    DrawVerticalSeparator(82, Color.grey);
+                    GUILayout.Space(topPadding);
+                    DrawVerticalSeparator(height - topPadding, Color.grey);
                 }
 
-                GUILayout.Space(1);
-                using (new EditorGUILayout.VerticalScope(GUILayout.Width(96)))
+                GUILayout.Space(buttonGap);
+                using (new EditorGUILayout.VerticalScope(GUILayout.Width(columnWidth), GUILayout.Height(height)))
                 {
-                    GUILayout.Space(2);
+                    GUILayout.Space(topPadding);
                     using (new EditorGUI.DisabledScope(!_remoteCheck.CanRetry))
                     {
                         var buttonText = _remoteCheck.Phase switch
@@ -165,16 +186,18 @@ namespace Elypha.VRChatUploader
                             RemoteAvatarCheckPhase.Failed => "Retry Check",
                             _ => "No Blueprint",
                         };
-                        if (GUILayout.Button(buttonText, GUILayout.Height(20)))
+                        if (GUILayout.Button(buttonText, GetAvatarActionButtonStyle(),
+                                GUILayout.Width(buttonWidth), GUILayout.Height(retryButtonHeight)))
                         {
                             RunRemoteAvatarCheck(_avatar.BlueprintId);
                         }
                     }
 
-                    GUILayout.Space(4);
+                    GUILayout.Space(verticalGap);
                     using (new EditorGUI.DisabledScope(!IsAvatarInfoReady()))
                     {
-                        if (GUILayout.Button("Build", GUILayout.Height(58)))
+                        if (GUILayout.Button("Build", GetAvatarActionButtonStyle(),
+                                GUILayout.Width(buttonWidth), GUILayout.Height(buildButtonHeight)))
                         {
                             RunBuildCache();
                         }
@@ -476,7 +499,7 @@ namespace Elypha.VRChatUploader
                     GUILayout.Space(EditorGUIUtility.singleLineHeight + 2f);
                     using (new EditorGUI.DisabledScope(!_operation.Busy))
                     {
-                        if (GUILayout.Button("Cancel", GUILayout.Height(28)))
+                        if (GUILayout.Button("Cancel", GUILayout.Height(22)))
                         {
                             _operation.Cancellation?.Cancel();
                             _log.Info("Cancellation requested.");
@@ -787,6 +810,17 @@ namespace Elypha.VRChatUploader
             };
 
             EditorGUILayout.LabelField(label, style, GUILayout.MinWidth(32), GUILayout.MaxWidth(500), GUILayout.ExpandWidth(true));
+        }
+
+        private static GUIStyle GetAvatarActionButtonStyle()
+        {
+            if (_avatarActionButtonStyle != null) return _avatarActionButtonStyle;
+
+            _avatarActionButtonStyle = new GUIStyle(GUI.skin.button)
+            {
+                margin = new RectOffset(0, 0, 0, 0)
+            };
+            return _avatarActionButtonStyle;
         }
 
         private static GUIStyle GetCacheEntryLabelStyle()
