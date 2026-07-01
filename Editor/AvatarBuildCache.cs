@@ -57,10 +57,11 @@ namespace Elypha.VRChatUploader
                 throw new FileNotFoundException("Cached .vrca was not found.", bundlePath);
             }
 
-            var manifest = LoadManifestForBundle(bundlePath);
+            var manifestPath = ManifestPathForBundle(bundlePath);
+            var manifest = LoadManifest(manifestPath);
             if (manifest == null)
             {
-                throw new FileNotFoundException("Cached .vrca manifest was not found.", ManifestPathForBundle(bundlePath));
+                throw new FileNotFoundException("Cached .vrca manifest was not found.", manifestPath);
             }
 
             if (!string.Equals(manifest.avatarId, context.AvatarId, StringComparison.Ordinal))
@@ -88,16 +89,31 @@ namespace Elypha.VRChatUploader
             return manifest;
         }
 
-        public static List<CachedAvatarBundleManifest> ListRecent()
+        public static List<CachedAvatarBundleManifest> ListRecent(VRChatUploaderLog log = null)
         {
             if (!Directory.Exists(CacheDirectory))
             {
                 return new List<CachedAvatarBundleManifest>();
             }
 
-            return Directory.EnumerateFiles(CacheDirectory, "*.vrca.json")
-                .Select(LoadManifest)
-                .Where(m => m != null && File.Exists(m.bundlePath))
+            var manifests = new List<CachedAvatarBundleManifest>();
+            foreach (var manifestPath in Directory.EnumerateFiles(CacheDirectory, "*.vrca.json"))
+            {
+                try
+                {
+                    var manifest = LoadManifest(manifestPath);
+                    if (manifest != null && File.Exists(manifest.bundlePath))
+                    {
+                        manifests.Add(manifest);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log?.Warn($"Cache manifest load failed: {manifestPath}: {VRChatUploaderLog.FormatException(ex)}");
+                }
+            }
+
+            return manifests
                 .OrderByDescending(m => m.createdAtLocal)
                 .Take(20)
                 .ToList();
@@ -110,17 +126,12 @@ namespace Elypha.VRChatUploader
                 return;
             }
 
-            DeleteBundle(manifest.bundlePath);
-        }
-
-        public static void DeleteBundle(string bundlePath)
-        {
-            if (string.IsNullOrWhiteSpace(bundlePath))
+            if (string.IsNullOrWhiteSpace(manifest.bundlePath))
             {
                 return;
             }
 
-            var fullBundlePath = Path.GetFullPath(bundlePath);
+            var fullBundlePath = Path.GetFullPath(manifest.bundlePath);
             EnsurePathIsInCache(fullBundlePath);
 
             var manifestPath = ManifestPathForBundle(fullBundlePath);
@@ -135,27 +146,32 @@ namespace Elypha.VRChatUploader
             }
         }
 
-        private static CachedAvatarBundleManifest LoadManifestForBundle(string bundlePath)
-        {
-            return LoadManifest(ManifestPathForBundle(bundlePath));
-        }
-
         private static CachedAvatarBundleManifest LoadManifest(string manifestPath)
         {
+            if (!File.Exists(manifestPath))
+            {
+                return null;
+            }
+
             try
             {
-                if (!File.Exists(manifestPath))
+                var manifest = JsonUtility.FromJson<CachedAvatarBundleManifest>(File.ReadAllText(manifestPath));
+                if (manifest == null || string.IsNullOrWhiteSpace(manifest.bundlePath))
                 {
-                    return null;
+                    throw new InvalidDataException("Cache manifest is missing required fields: " + manifestPath);
                 }
 
-                var manifest = JsonUtility.FromJson<CachedAvatarBundleManifest>(File.ReadAllText(manifestPath));
                 ApplyLabels(manifest);
                 return manifest;
             }
-            catch
+            catch (Exception ex)
             {
-                return null;
+                if (ex is InvalidDataException)
+                {
+                    throw;
+                }
+
+                throw new InvalidDataException("Failed to load cache manifest: " + manifestPath, ex);
             }
         }
 

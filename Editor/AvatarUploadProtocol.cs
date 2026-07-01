@@ -24,11 +24,11 @@ namespace Elypha.VRChatUploader
 
         private readonly int workers;
         private readonly int partSizeMiB;
-        private readonly Action<string> log;
+        private readonly VRChatUploaderLog log;
         private readonly AvatarUploadProgressHandler progress;
         private readonly AvatarUploadWorkerProgressHandler workerProgress;
 
-        public AvatarUploadProtocol(int workers, int partSizeMiB, Action<string> log, AvatarUploadProgressHandler progress,
+        public AvatarUploadProtocol(int workers, int partSizeMiB, VRChatUploaderLog log, AvatarUploadProgressHandler progress,
             AvatarUploadWorkerProgressHandler workerProgress = null)
         {
             this.workers = Mathf.Clamp(workers, 1, 8);
@@ -51,10 +51,25 @@ namespace Elypha.VRChatUploader
                 ? ""
                 : ApiFile.ParseFileIdFromFileAPIUrl(currentAssetUrl);
 
-            return await UploadFile(bundlePath, existingFileId, fileName, token);
+            return await UploadFile(bundlePath, existingFileId, fileName, "AvatarBundle", token);
         }
 
-        private async Task<string> UploadFile(string filename, string fileId, string friendlyFileName, CancellationToken token)
+        public async Task<string> UploadAvatarImage(AvatarUploadContext context, string imagePath, CancellationToken token)
+        {
+            var fileName = "Avatar - " + context.Avatar.Name + " - Image - " + Application.unityVersion + "_" +
+                           ApiAvatar.VERSION.ApiVersion + "_" + VRC.Tools.Platform + "_" +
+                           API.GetServerEnvironmentForApiUrl();
+            var currentImageUrl = string.IsNullOrWhiteSpace(context.ImageUrl)
+                ? context.Avatar.ImageUrl
+                : context.ImageUrl;
+            var existingFileId = string.IsNullOrWhiteSpace(currentImageUrl)
+                ? ""
+                : ApiFile.ParseFileIdFromFileAPIUrl(currentImageUrl);
+
+            return await UploadFile(imagePath, existingFileId, fileName, "AvatarImage", token);
+        }
+
+        private async Task<string> UploadFile(string filename, string fileId, string friendlyFileName, string contentKind, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
 
@@ -72,22 +87,23 @@ namespace Elypha.VRChatUploader
                     {"extension", extension}
                 };
                 currentFile = await VRCApi.Post<Dictionary<string, string>, VRCFile>("file", requestData, cancellationToken: token);
-                log($"VRCApi.UploadFile/AvatarBundle: created file record {currentFile.ID}.");
+                log.Info($"VRCApi.UploadFile/{contentKind}: created file record {currentFile.ID}.");
             }
             else
             {
+                log.Info($"VRCApi.UploadFile/{contentKind}: loading existing file record {fileId}.");
                 currentFile = await VRCApi.Get<VRCFile>("file/" + fileId, forceRefresh: true, cancellationToken: token);
-                log($"VRCApi.UploadFile/AvatarBundle: using file {currentFile.ID}, latest version {currentFile.GetLatestVersion()}.");
+                log.Info($"VRCApi.UploadFile/{contentKind}: using file {currentFile.ID}, latest version {currentFile.GetLatestVersion()}.");
             }
 
             if (string.IsNullOrWhiteSpace(currentFile.ID))
             {
-                throw new UploadException("VRCApi.UploadFile/AvatarBundle: failed to load or create file record.");
+                throw new UploadException($"VRCApi.UploadFile/{contentKind}: failed to load or create file record.");
             }
 
             if (currentFile.HasQueuedOperation())
             {
-                log($"VRCApi.UploadFile/AvatarBundle: latest version is queued; deleting it before retry. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                log.Info($"VRCApi.UploadFile/{contentKind}: latest version is queued; deleting it before retry. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 await VRCApi.Delete($"file/{currentFile.ID}/{currentFile.GetLatestVersion()}", cancellationToken: token);
                 await Task.Delay(1000, token);
                 currentFile = await VRCApi.Get<VRCFile>("file/" + currentFile.ID, forceRefresh: true, cancellationToken: token);
@@ -95,7 +111,7 @@ namespace Elypha.VRChatUploader
 
             if (currentFile.IsLatestVersionErrored())
             {
-                log($"VRCApi.UploadFile/AvatarBundle: latest version is errored; deleting it before retry. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                log.Info($"VRCApi.UploadFile/{contentKind}: latest version is errored; deleting it before retry. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 await VRCApi.Delete($"file/{currentFile.ID}/{currentFile.GetLatestVersion()}", cancellationToken: token);
                 await Task.Delay(1000, token);
                 currentFile = await VRCApi.Get<VRCFile>("file/" + currentFile.ID, forceRefresh: true, cancellationToken: token);
@@ -112,7 +128,7 @@ namespace Elypha.VRChatUploader
             var signatureMd5Base64 = Convert.ToBase64String(signatureMd5Bytes);
             var signatureMimeType = AvatarFileUtil.GetMimeTypeFromExtension(".sig");
 
-            log($"VRCApi.UploadFile/AvatarBundle: local file size={AvatarFileUtil.FormatBytes(fileSize)}, md5={fileMd5Base64}, signatureSize={AvatarFileUtil.FormatBytes(signatureSize)}, signatureMd5={signatureMd5Base64}, sdk={VRC.Tools.SdkVersion}.");
+            log.Info($"VRCApi.UploadFile/{contentKind}: local file size={AvatarFileUtil.FormatBytes(fileSize)}, MD5={fileMd5Base64}.");
 
             try
             {
@@ -134,11 +150,11 @@ namespace Elypha.VRChatUploader
                         if (exactMatch)
                         {
                             versionAlreadyExists = true;
-                            log($"VRCApi.UploadFile/AvatarBundle: exact waiting version found; will resume. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                            log.Info($"VRCApi.UploadFile/{contentKind}: exact waiting version found; will resume. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                         }
                         else
                         {
-                            log($"VRCApi.UploadFile/AvatarBundle: waiting version matched file MD5 only; deleting. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                            log.Info($"VRCApi.UploadFile/{contentKind}: waiting version matched file MD5 only; deleting. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                             await VRCApi.Delete($"file/{currentFile.ID}/{currentFile.GetLatestVersion()}", cancellationToken: token);
                             await Task.Delay(1000, token);
                             currentFile = await VRCApi.Get<VRCFile>("file/" + currentFile.ID, forceRefresh: true, cancellationToken: token);
@@ -146,7 +162,7 @@ namespace Elypha.VRChatUploader
                     }
                     else if (currentFile.IsLatestVersionWaiting())
                     {
-                        log($"VRCApi.UploadFile/AvatarBundle: latest waiting version belongs to another file; deleting. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                        log.Info($"VRCApi.UploadFile/{contentKind}: latest waiting version belongs to another file; deleting. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                         await VRCApi.Delete($"file/{currentFile.ID}/{currentFile.GetLatestVersion()}", cancellationToken: token);
                         await Task.Delay(1000, token);
                         currentFile = await VRCApi.Get<VRCFile>("file/" + currentFile.ID, forceRefresh: true, cancellationToken: token);
@@ -163,14 +179,15 @@ namespace Elypha.VRChatUploader
                         {"fileSizeInBytes", fileSize}
                     };
 
+                    log.Info($"VRCApi.UploadFile/{contentKind}: creating new file version. file={currentFile.ID}.");
                     var updatedFile = await VRCApi.Post<Dictionary<string, object>, VRCFile>(
                         $"file/{currentFile.ID}", requestData, cancellationToken: token);
                     if (string.IsNullOrWhiteSpace(updatedFile.ID))
                     {
-                        throw new UploadException($"VRCApi.UploadFile/AvatarBundle: failed to create new file version. file={currentFile.ID}");
+                        throw new UploadException($"VRCApi.UploadFile/{contentKind}: failed to create new file version. file={currentFile.ID}");
                     }
 
-                    log($"VRCApi.UploadFile/AvatarBundle: created version {currentFile.GetLatestVersion()} -> {updatedFile.GetLatestVersion()} for file={currentFile.ID}.");
+                    log.Info($"VRCApi.UploadFile/{contentKind}: created version {currentFile.GetLatestVersion()} -> {updatedFile.GetLatestVersion()} for file={currentFile.ID}.");
                     currentFile = updatedFile;
                     await Task.Delay(1000, token);
                 }
@@ -178,61 +195,59 @@ namespace Elypha.VRChatUploader
                 var fileDescriptor = currentFile.Versions[currentFile.GetLatestVersion()].File;
                 if (fileDescriptor == null)
                 {
-                    throw new UploadException($"VRCApi.UploadFile/AvatarBundle: File descriptor is missing. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                    throw new UploadException($"VRCApi.UploadFile/{contentKind}: File descriptor is missing. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 }
 
                 if (fileDescriptor.Status == "waiting")
                 {
-                    log($"VRCApi.UploadFile/AvatarBundle: File descriptor category={fileDescriptor.Category}, status={fileDescriptor.Status}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                     if (fileDescriptor.Category == "simple")
                     {
-                        await UploadSimple(filename, FileUploadType.File, currentFile, mimeType, fileMd5Bytes,
+                        await UploadSimple(filename, FileUploadType.File, currentFile, mimeType, fileMd5Bytes, contentKind,
                             (status, percentage) => ReportUploadProgress(status, 0.15f + percentage * 0.75f), token);
                     }
                     else
                     {
-                        await UploadMultipart(filename, FileUploadType.File, currentFile,
+                        await UploadMultipart(filename, FileUploadType.File, currentFile, contentKind,
                             (status, percentage) => ReportUploadProgress(status, 0.15f + percentage * 0.75f), token);
                     }
                 }
                 else
                 {
-                    log($"VRCApi.UploadFile/AvatarBundle: File upload skipped because status is {fileDescriptor.Status}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                    log.Info($"VRCApi.UploadFile/{contentKind}: File upload skipped because status is {fileDescriptor.Status}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 }
 
                 var signatureDescriptor = currentFile.Versions[currentFile.GetLatestVersion()].Signature;
                 if (signatureDescriptor == null)
                 {
-                    throw new UploadException($"VRCApi.UploadFile/AvatarBundle: Signature descriptor is missing. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                    throw new UploadException($"VRCApi.UploadFile/{contentKind}: Signature descriptor is missing. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 }
 
                 if (signatureDescriptor.Status == "waiting")
                 {
-                    log($"VRCApi.UploadFile/AvatarBundle: Signature descriptor category={signatureDescriptor.Category}, status={signatureDescriptor.Status}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                     if (signatureDescriptor.Category == "simple")
                     {
                         await UploadSimple(signaturePath, FileUploadType.Signature, currentFile, signatureMimeType,
-                            signatureMd5Bytes, (status, percentage) => ReportUploadProgress(status, 0.92f + percentage * 0.07f), token);
+                            signatureMd5Bytes, contentKind, (status, percentage) => ReportUploadProgress(status, 0.92f + percentage * 0.07f), token);
                     }
                     else
                     {
-                        await UploadMultipart(signaturePath, FileUploadType.Signature, currentFile,
+                        await UploadMultipart(signaturePath, FileUploadType.Signature, currentFile, contentKind,
                             (status, percentage) => ReportUploadProgress(status, 0.92f + percentage * 0.07f), token);
                     }
                 }
                 else
                 {
-                    log($"VRCApi.UploadFile/AvatarBundle: Signature upload skipped because status is {signatureDescriptor.Status}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                    log.Info($"VRCApi.UploadFile/{contentKind}: Signature upload skipped because status is {signatureDescriptor.Status}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 }
 
                 await Task.Delay(5000, token);
                 currentFile = await VRCApi.Get<VRCFile>($"file/{currentFile.ID}", forceRefresh: true, cancellationToken: token);
                 var latest = currentFile.Versions[currentFile.GetLatestVersion()];
-                log($"VRCApi.UploadFile/AvatarBundle: final status file={currentFile.ID}, version={latest.Version}, status={latest.Status}, fileStatus={latest.File?.Status}, signatureStatus={latest.Signature?.Status}.");
+                log.Info($"VRCApi.UploadFile/{contentKind}: final status file={currentFile.ID}, version={latest.Version}, status={latest.Status}, fileStatus={latest.File?.Status}, signatureStatus={latest.Signature?.Status}.");
 
                 if (latest.File == null || string.IsNullOrWhiteSpace(latest.File.URL))
                 {
-                    throw new UploadException($"VRCApi.UploadFile/AvatarBundle: final file URL is empty. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
+                    throw new UploadException($"VRCApi.UploadFile/{contentKind}: final file URL is empty. file={currentFile.ID}, version={currentFile.GetLatestVersion()}.");
                 }
 
                 ReportUploadProgress("File upload finished", 1f);
@@ -245,7 +260,7 @@ namespace Elypha.VRChatUploader
         }
 
         private async Task UploadSimple(string filename, FileUploadType fileUploadType, VRCFile currentFile, string mimeType,
-            byte[] fileContent, Action<string, float> onProgress, CancellationToken token)
+            byte[] fileContent, string contentKind, Action<string, float> onProgress, CancellationToken token)
         {
             var uploadKind = fileUploadType.ToString().ToLowerInvariant();
             var endpoint = $"file/{currentFile.ID}/{currentFile.GetLatestVersion()}/{uploadKind}/start";
@@ -253,11 +268,11 @@ namespace Elypha.VRChatUploader
             var uploadUrl = startUploadResp.Value<string>("url");
             if (string.IsNullOrWhiteSpace(uploadUrl))
             {
-                throw new UploadException($"VRCApi.UploadSimple/AvatarBundle: upload URL is empty. endpoint={endpoint}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}.");
+                throw new UploadException($"VRCApi.UploadSimple/{contentKind}: upload URL is empty. endpoint={endpoint}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}.");
             }
 
             var fileData = await File.ReadAllBytesAsync(filename, token);
-            log($"VRCApi.UploadSimple/AvatarBundle: PUT started. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, size={AvatarFileUtil.FormatBytes(fileData.LongLength)}.");
+            log.Info($"VRCApi.UploadSimple/{contentKind}: uploading {fileUploadType}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, size={AvatarFileUtil.FormatBytes(fileData.LongLength)}.");
             await VRCApi.MakeRequestWithResponse<byte[], byte[]>(
                 uploadUrl,
                 HttpMethod.Put,
@@ -270,18 +285,17 @@ namespace Elypha.VRChatUploader
 
             await VRCApi.Put<byte[]>($"file/{currentFile.ID}/{currentFile.GetLatestVersion()}/{uploadKind}/finish",
                 cancellationToken: token);
-            log($"VRCApi.UploadSimple/AvatarBundle: complete. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}.");
+            log.Info($"VRCApi.UploadSimple/{contentKind}: complete. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}.");
         }
 
         private async Task UploadMultipart(string filename, FileUploadType fileUploadType, VRCFile currentFile,
-            Action<string, float> onProgress, CancellationToken token)
+            string contentKind, Action<string, float> onProgress, CancellationToken token)
         {
             var uploadKind = fileUploadType.ToString().ToLowerInvariant();
             var statusEndpoint = $"file/{currentFile.ID}/{currentFile.GetLatestVersion()}/{uploadKind}/status";
             var uploadStatus = await VRCApi.Get<JObject>(statusEndpoint, cancellationToken: token);
 
-            var rawNextPartNumber = uploadStatus.Value<int>("nextPartNumber");
-            var nextPartNumber = 1 + rawNextPartNumber;
+            var nextPartNumber = 1 + uploadStatus.Value<int>("nextPartNumber");
             var statusEtags = uploadStatus.Value<JArray>("etags")?.ToObject<List<string>>() ?? new List<string>();
             var etagsByPart = new Dictionary<int, string>();
             for (var i = 0; i < statusEtags.Count; i++)
@@ -292,7 +306,7 @@ namespace Elypha.VRChatUploader
             var fileSize = new FileInfo(filename).Length;
             var partSizeBytes = partSizeMiB * 1024 * 1024;
             var parts = Math.Max(1, (int)Math.Ceiling((double)fileSize / partSizeBytes));
-            log($"VRCApi.UploadMultipart/AvatarBundle: status rawNextPartNumber={rawNextPartNumber}, startPart={nextPartNumber}, etags={statusEtags.Count}, parts={parts}, partSize={AvatarFileUtil.FormatBytes(partSizeBytes)}, workers={workers}, endpoint={statusEndpoint}.");
+            log.Info($"VRCApi.UploadMultipart/{contentKind}: uploading {fileUploadType}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, parts={parts}, startPart={nextPartNumber}, partSize={AvatarFileUtil.FormatBytes(partSizeBytes)}, workers={workers}.");
 
             if (nextPartNumber > 1)
             {
@@ -313,7 +327,7 @@ namespace Elypha.VRChatUploader
                 {
                     var workerIndex = partNumber - batchStart;
                     tasks.Add(UploadMultipartPart(filename, fileUploadType, currentFile, partNumber, parts, fileSize,
-                        partSizeBytes, workerIndex, onProgress, token));
+                        partSizeBytes, workerIndex, contentKind, onProgress, token));
                 }
 
                 var results = await Task.WhenAll(tasks);
@@ -323,7 +337,6 @@ namespace Elypha.VRChatUploader
                 }
 
                 onProgress?.Invoke($"Uploaded {fileUploadType} parts {batchStart}-{batchEnd}/{parts}", (float)batchEnd / parts);
-                log($"VRCApi.UploadMultipart/AvatarBundle: batch complete {batchStart}-{batchEnd}/{parts}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}.");
             }
 
             var orderedEtags = new List<string>();
@@ -331,22 +344,23 @@ namespace Elypha.VRChatUploader
             {
                 if (!etagsByPart.TryGetValue(partNumber, out var etag) || string.IsNullOrWhiteSpace(etag))
                 {
-                    throw new UploadException($"VRCApi.UploadMultipart/AvatarBundle: missing ETag. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
+                    throw new UploadException($"VRCApi.UploadMultipart/{contentKind}: missing ETag. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
                 }
 
                 orderedEtags.Add(etag);
             }
 
+            log.Info($"VRCApi.UploadMultipart/{contentKind}: finishing multipart upload. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, parts={parts}.");
             await VRCApi.Put<Dictionary<string, List<string>>, byte[]>(
                 $"file/{currentFile.ID}/{currentFile.GetLatestVersion()}/{uploadKind}/finish",
                 new Dictionary<string, List<string>> {{"etags", orderedEtags}},
                 cancellationToken: token);
-            log($"VRCApi.UploadMultipart/AvatarBundle: complete. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, parts={parts}.");
+            log.Info($"VRCApi.UploadMultipart/{contentKind}: complete. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, parts={parts}.");
         }
 
         private async Task<PartUploadResult> UploadMultipartPart(string filename, FileUploadType fileUploadType,
             VRCFile currentFile, int partNumber, int parts, long fileSize, int partSizeBytes,
-            int workerIndex, Action<string, float> onProgress, CancellationToken token)
+            int workerIndex, string contentKind, Action<string, float> onProgress, CancellationToken token)
         {
             var uploadKind = fileUploadType.ToString().ToLowerInvariant();
             var startEndpoint = $"file/{currentFile.ID}/{currentFile.GetLatestVersion()}/{uploadKind}/start";
@@ -357,18 +371,17 @@ namespace Elypha.VRChatUploader
             var uploadUrl = startUploadResp.Value<string>("url");
             if (string.IsNullOrWhiteSpace(uploadUrl))
             {
-                throw new UploadException($"VRCApi.UploadMultipart/AvatarBundle: part upload URL is empty. endpoint={startEndpoint}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
+                throw new UploadException($"VRCApi.UploadMultipart/{contentKind}: part upload URL is empty. endpoint={startEndpoint}, file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
             }
 
             var offset = (long)(partNumber - 1) * partSizeBytes;
             var bytesToRead = partNumber < parts ? partSizeBytes : fileSize - offset;
             if (bytesToRead <= 0 || bytesToRead > int.MaxValue)
             {
-                throw new UploadException($"VRCApi.UploadMultipart/AvatarBundle: invalid byte count {bytesToRead}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
+                throw new UploadException($"VRCApi.UploadMultipart/{contentKind}: invalid byte count {bytesToRead}. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
             }
 
             var bytes = await AvatarFileUtil.ReadFileRange(filename, offset, (int)bytesToRead, token);
-            log($"VRCApi.UploadMultipart/AvatarBundle: part PUT started. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}, offset={offset}, size={AvatarFileUtil.FormatBytes(bytes.LongLength)}.");
             var partStatus = $"{fileUploadType} part {partNumber}/{parts}";
             workerProgress?.Invoke(workerIndex, partStatus, 0f);
             var partProgressStart = (float)(partNumber - 1) / parts;
@@ -389,10 +402,9 @@ namespace Elypha.VRChatUploader
             var etag = result.responseMessage.Headers.ETag?.Tag?.Trim('"', '\'');
             if (string.IsNullOrWhiteSpace(etag))
             {
-                throw new UploadException($"VRCApi.UploadMultipart/AvatarBundle: missing ETag. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
+                throw new UploadException($"VRCApi.UploadMultipart/{contentKind}: missing ETag. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}.");
             }
 
-            log($"VRCApi.UploadMultipart/AvatarBundle: part complete. file={currentFile.ID}, version={currentFile.GetLatestVersion()}, uploadType={fileUploadType}, part={partNumber}/{parts}, etag={etag}.");
             workerProgress?.Invoke(workerIndex, partStatus, 1f);
             return new PartUploadResult(partNumber, etag);
         }
@@ -402,7 +414,8 @@ namespace Elypha.VRChatUploader
 
         public static bool IsAlreadyUploadedError(Exception ex)
         {
-            return ex.ToString().IndexOf("already uploaded", StringComparison.OrdinalIgnoreCase) >= 0;
+            var message = ex is ApiErrorException apiError ? apiError.ErrorMessage : ex.Message;
+            return message?.IndexOf("already uploaded", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static void TryDelete(string path)

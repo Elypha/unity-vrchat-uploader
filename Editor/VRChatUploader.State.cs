@@ -1,5 +1,7 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
+using UnityEditor;
 using UnityEngine;
 using VRC.Core;
 using VRC.SDKBase;
@@ -57,16 +59,17 @@ namespace Elypha.VRChatUploader
 
             public void MarkExistingAvatar()
             {
+                IsNewAvatar = false;
                 StatusText = BlueprintId;
             }
         }
 
         private enum RemoteAvatarCheckPhase
         {
+            NotNeeded,
+            Checking,
             Ok,
             Failed,
-            Checking,
-            NotNeeded,
         }
 
         private sealed class RemoteAvatarCheckState
@@ -166,6 +169,85 @@ namespace Elypha.VRChatUploader
 
                 var progress = (_activeProgressStep + Mathf.Clamp01(percentage)) / _activeProgressStages.Length;
                 return Mathf.Clamp01(Math.Max(CurrentProgress, progress));
+            }
+        }
+
+        private sealed class UploaderOperation
+        {
+            public readonly string Name;
+            public readonly AvatarUploadProgressStage[] ProgressStages;
+            public readonly int WorkerBars;
+            public readonly Func<AvatarUploadWorkflow, CancellationToken, Task<CachedAvatarBundleManifest>> Execute;
+            public readonly bool RefreshAvatarAfter;
+            public readonly bool SelectManifestAfter;
+
+            public UploaderOperation(
+                string name,
+                AvatarUploadProgressStage[] progressStages,
+                int workerBars,
+                Func<AvatarUploadWorkflow, CancellationToken, Task<CachedAvatarBundleManifest>> execute,
+                bool refreshAvatarAfter = false,
+                bool selectManifestAfter = false)
+            {
+                Name = name;
+                ProgressStages = progressStages;
+                WorkerBars = workerBars;
+                Execute = execute;
+                RefreshAvatarAfter = refreshAvatarAfter;
+                SelectManifestAfter = selectManifestAfter;
+            }
+        }
+
+        private sealed class EditorOperationProgressSink
+        {
+            private readonly VRChatUploader owner;
+            private readonly int operationSerial;
+
+            public EditorOperationProgressSink(VRChatUploader owner, int operationSerial)
+            {
+                this.owner = owner;
+                this.operationSerial = operationSerial;
+            }
+
+            public void ReportStage(AvatarUploadProgressStage stage, string status, float percentage)
+            {
+                Post(() =>
+                {
+                    owner._operation.SetStageProgress(stage, status, percentage);
+                    EditorUtility.DisplayProgressBar(WindowTitle, owner._operation.StatusText, owner._operation.CurrentProgress);
+                });
+            }
+
+            public void ReportWorker(int workerIndex, string status, float percentage)
+            {
+                Post(() => owner._operation.SetWorkerProgress(workerIndex, status, percentage));
+            }
+
+            private void Post(Action action)
+            {
+                Post(() =>
+                {
+                    action();
+                    return true;
+                });
+            }
+
+            private void Post(Func<bool> action)
+            {
+                EditorApplication.delayCall += () =>
+                {
+                    if (owner == null || !owner._operation.Busy || owner._operationSerial != operationSerial)
+                    {
+                        return;
+                    }
+
+                    if (!action())
+                    {
+                        return;
+                    }
+
+                    owner.Repaint();
+                };
             }
         }
     }

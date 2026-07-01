@@ -58,7 +58,6 @@ namespace Elypha.VRChatUploader
         private static GUIStyle _cacheEntryButtonStyle;
 
         [SerializeField] private string _newAvatarReleaseStatus = "private";
-        [SerializeField] private string _coverImagePath;
         [SerializeField] private int _uploadAttempts = DefaultAttempts;
         [SerializeField] private float _retryDelaySeconds = DefaultRetryDelaySeconds;
         [SerializeField] private int _concurrentWorkers = AvatarUploadProtocol.DefaultWorkers;
@@ -71,6 +70,7 @@ namespace Elypha.VRChatUploader
         private readonly RemoteAvatarCheckState _remoteCheck = new();
         private readonly OperationState _operation = new(MaxWorkerProgressBars);
         private readonly VRChatUploaderLog _log = new();
+        private int _operationSerial;
         private List<CachedAvatarBundleManifest> _allCacheEntries = new();
         private Vector2 _mainScroll;
         private Vector2 _logScroll;
@@ -118,7 +118,7 @@ namespace Elypha.VRChatUploader
         private void DrawAvatarSection()
         {
             DrawTitle($"Avatar  →  {_avatar.StatusText}");
-            var labelWidth = CalculateLabelWidth("Avatar Root", "Name", "Visibility", "Cover");
+            var labelWidth = CalculateLabelWidth("Avatar Root", "Name", "Visibility");
 
             using (new EditorGUILayout.HorizontalScope())
             {
@@ -126,7 +126,7 @@ namespace Elypha.VRChatUploader
                 {
                     DrawAvatarSelector(labelWidth);
 
-                    using (new EditorGUI.DisabledScope(_avatar.Root == null))
+                    using (new EditorGUI.DisabledScope(_avatar.Root == null || !_avatar.IsNewAvatar))
                     {
                         _newAvatarName = DrawTextRow("Name",
                             string.IsNullOrWhiteSpace(_newAvatarName) && _avatar.Root != null
@@ -142,8 +142,6 @@ namespace Elypha.VRChatUploader
                             releaseIndex = GUILayout.Toolbar(releaseIndex, ReleaseStatusOptions, GUILayout.ExpandWidth(true));
                             _newAvatarReleaseStatus = ReleaseStatusOptions[releaseIndex];
                         }
-
-                        DrawCoverSelector(labelWidth);
                     }
                 }
 
@@ -158,7 +156,7 @@ namespace Elypha.VRChatUploader
                 using (new EditorGUILayout.VerticalScope(GUILayout.Width(96)))
                 {
                     GUILayout.Space(2);
-                    using (new EditorGUI.DisabledScope(!CanRetryRemoteCheck()))
+                    using (new EditorGUI.DisabledScope(!_remoteCheck.CanRetry))
                     {
                         var buttonText = _remoteCheck.Phase switch
                         {
@@ -225,34 +223,6 @@ namespace Elypha.VRChatUploader
             }
         }
 
-        private void DrawCoverSelector(float labelWidth)
-        {
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                using (new EditorGUI.DisabledScope(!CanEditCover()))
-                {
-                    EditorGUILayout.LabelField("Cover", GUILayout.Width(labelWidth));
-                    _coverImagePath = EditorGUILayout.TextField(_coverImagePath, GUILayout.ExpandWidth(true));
-                    if (GUILayout.Button("Pick", GUILayout.Width(48)))
-                    {
-                        var picked = EditorUtility.OpenFilePanel("Pick avatar cover", AvatarBuildCache.CacheDirectory, "png,jpg,jpeg");
-                        if (!string.IsNullOrWhiteSpace(picked))
-                        {
-                            _coverImagePath = picked;
-                        }
-                    }
-
-                    using (new EditorGUI.DisabledScope(string.IsNullOrWhiteSpace(_coverImagePath)))
-                    {
-                        if (GUILayout.Button("Clear", GUILayout.Width(48)))
-                        {
-                            _coverImagePath = "";
-                        }
-                    }
-                }
-            }
-        }
-
         private void UpdateAvatarInfo(VRC_AvatarDescriptor avatarDescriptor)
         {
             if (avatarDescriptor == null)
@@ -261,51 +231,31 @@ namespace Elypha.VRChatUploader
                 return;
             }
 
+            var previousRoot = _avatar.Root;
             _avatar.SelectDescriptor(avatarDescriptor);
 
-            if (string.IsNullOrWhiteSpace(_newAvatarName))
+            if (previousRoot != _avatar.Root || string.IsNullOrWhiteSpace(_newAvatarName))
+            {
                 _newAvatarName = _avatar.Root.name;
+            }
 
             if (!_avatar.Root.TryGetComponent<PipelineManager>(out var pipelineManager))
             {
-                MarkAvatarWithoutPipeline();
+                _avatar.MarkMissingPipeline();
+                _remoteCheck.Reset();
+                ClearInvalidCacheSelection();
                 return;
             }
 
             _avatar.SelectPipeline(pipelineManager);
             if (!_avatar.HasBlueprint)
             {
-                MarkSelectedAvatarAsNew();
+                _avatar.MarkNewAvatar();
+                _remoteCheck.Reset();
+                ClearInvalidCacheSelection();
                 return;
             }
 
-            MarkSelectedAvatarAsExisting();
-        }
-
-        private void ClearAvatarSelection()
-        {
-            _avatar.Clear();
-            _newAvatarName = null;
-            ResetRemoteCheck();
-            ClearInvalidCacheSelection();
-        }
-
-        private void MarkAvatarWithoutPipeline()
-        {
-            _avatar.MarkMissingPipeline();
-            ResetRemoteCheck();
-            ClearInvalidCacheSelection();
-        }
-
-        private void MarkSelectedAvatarAsNew()
-        {
-            _avatar.MarkNewAvatar();
-            ResetRemoteCheck();
-            ClearInvalidCacheSelection();
-        }
-
-        private void MarkSelectedAvatarAsExisting()
-        {
             _avatar.MarkExistingAvatar();
             ClearInvalidCacheSelection();
             if (!string.Equals(_remoteCheck.BlueprintId, _avatar.BlueprintId, StringComparison.Ordinal))
@@ -314,19 +264,20 @@ namespace Elypha.VRChatUploader
             }
         }
 
-        private void ResetRemoteCheck()
+        private void ClearAvatarSelection()
         {
+            _avatar.Clear();
+            _newAvatarName = null;
             _remoteCheck.Reset();
+            ClearInvalidCacheSelection();
         }
 
         private void RunRemoteAvatarCheck(string blueprintId)
         {
             var serial = _remoteCheck.Begin(blueprintId);
-            _avatar.IsNewAvatar = false;
             Repaint();
 
             _ = RunCheck();
-            return;
 
             async Task RunCheck()
             {
@@ -334,31 +285,38 @@ namespace Elypha.VRChatUploader
                 {
                     var avatar = await VRCApi.GetAvatar(blueprintId, forceRefresh: true);
 
-                    if (!IsCurrentRemoteCheck(blueprintId, serial)) return;
+                    if (!IsCurrent()) return;
                     if (APIUser.CurrentUser == null)
                         throw new InvalidOperationException("VRChat user is not logged in.");
                     if (avatar.AuthorId != APIUser.CurrentUser.id)
                         throw new InvalidOperationException("Remote avatar belongs to a different user.");
 
                     _avatar.IsNewAvatar = avatar.PendingUpload;
+                    if (!avatar.PendingUpload)
+                    {
+                        _newAvatarName = avatar.Name ?? "";
+                        _newAvatarReleaseStatus = NormalizeReleaseStatus(avatar.ReleaseStatus);
+                    }
+
                     _remoteCheck.Phase = RemoteAvatarCheckPhase.Ok;
                 }
                 catch (Exception ex)
                 {
-                    if (!IsCurrentRemoteCheck(blueprintId, serial)) return;
+                    if (!IsCurrent()) return;
 
-                    _avatar.IsNewAvatar = false;
                     _remoteCheck.Phase = RemoteAvatarCheckPhase.Failed;
-                    _log.Info("Remote avatar check failed: " + ex.Message);
+                    _log.Warn("Remote avatar check failed: " + VRChatUploaderLog.FormatException(ex));
                 }
                 finally
                 {
-                    if (IsCurrentRemoteCheck(blueprintId, serial))
+                    if (IsCurrent())
                     {
                         Repaint();
                     }
                 }
             }
+
+            bool IsCurrent() => _remoteCheck.IsCurrent(blueprintId, serial);
         }
 
         private void DrawCacheSection()
@@ -368,7 +326,9 @@ namespace Elypha.VRChatUploader
             using (new EditorGUILayout.HorizontalScope())
             {
                 using (new EditorGUILayout.VerticalScope(GUILayout.ExpandWidth(true)))
+                {
                     DrawCacheListColumn();
+                }
 
                 GUILayout.Space(1);
                 using (new EditorGUILayout.VerticalScope())
@@ -379,7 +339,9 @@ namespace Elypha.VRChatUploader
 
                 GUILayout.Space(1);
                 using (new EditorGUILayout.VerticalScope(GUILayout.Width(CacheActionsWidth)))
+                {
                     DrawCacheActionsColumn();
+                }
             }
         }
 
@@ -393,9 +355,15 @@ namespace Elypha.VRChatUploader
                 GUILayout.FlexibleSpace();
 
                 if (GUILayout.Button("Open Folder", GUILayout.Width(88)))
-                    OpenCacheFolder();
+                {
+                    Directory.CreateDirectory(AvatarBuildCache.CacheDirectory);
+                    EditorUtility.RevealInFinder(AvatarBuildCache.CacheDirectory);
+                }
+
                 if (GUILayout.Button("Refresh", GUILayout.Width(70)))
+                {
                     RefreshCacheEntries();
+                }
             }
 
             var listHeight = (EditorGUIUtility.singleLineHeight + 3f) * CacheVisibleRows + 6f;
@@ -459,9 +427,14 @@ namespace Elypha.VRChatUploader
                 using (new EditorGUI.DisabledScope(!CanUploadCachedBundle()))
                 {
                     if (GUILayout.Button("Upload\n(Concurrent)", GUILayout.Width(buttonWidth), GUILayout.Height(tallButtonHeight)))
+                    {
                         RunConcurrentUploadCached();
+                    }
+
                     if (GUILayout.Button("Upload\n(Official)", GUILayout.Width(buttonWidth), GUILayout.Height(tallButtonHeight)))
+                    {
                         RunOfficialUploadCached();
+                    }
                 }
             }
 
@@ -470,9 +443,14 @@ namespace Elypha.VRChatUploader
                 using (new EditorGUI.DisabledScope(!IsAvatarInfoReady()))
                 {
                     if (GUILayout.Button("Build & ⇧", GUILayout.Width(buttonWidth), GUILayout.Height(buttonHeight)))
+                    {
                         RunBuildCacheAndUploadConcurrent();
+                    }
+
                     if (GUILayout.Button("Build & ⇧", GUILayout.Width(buttonWidth), GUILayout.Height(buttonHeight)))
+                    {
                         RunBuildCacheAndUploadOfficial();
+                    }
                 }
             }
         }
@@ -550,50 +528,64 @@ namespace Elypha.VRChatUploader
             }
             catch (Exception ex)
             {
-                _log.Info("Failed to delete cached bundle: " + ex.Message);
+                _log.Error("Failed to delete cached bundle", ex);
                 Debug.LogException(ex);
             }
         }
 
         private void RunBuildCache() =>
-            _ = RunExclusive("build-cache", BuildCacheProgressStages, 0, async token =>
-            {
-                var manifest = await CreateWorkflow().BuildCache(token);
-                UpdateAvatarInfo(_avatar.Descriptor);
-                _selectedBundlePath = manifest.bundlePath;
-            });
+            RunUploaderOperation(new UploaderOperation(
+                "build-cache",
+                BuildCacheProgressStages,
+                0,
+                (workflow, token) => workflow.BuildCache(token),
+                refreshAvatarAfter: true,
+                selectManifestAfter: true));
 
         private void RunConcurrentUploadCached() =>
-            _ = RunExclusive("concurrent-upload-cached", UploadProgressStages, GetConcurrentWorkerBars(),
-                async token => { await CreateWorkflow().UploadCachedConcurrent(token); });
+            RunUploaderOperation(new UploaderOperation(
+                "concurrent-upload-cached",
+                UploadProgressStages,
+                GetConcurrentWorkerBars(),
+                async (workflow, token) =>
+                {
+                    await workflow.UploadCachedConcurrent(token);
+                    return null;
+                }));
 
         private void RunOfficialUploadCached() =>
-            _ = RunExclusive("official-upload-cached", UploadProgressStages, 0,
-                async token => { await CreateWorkflow().UploadCachedOfficial(token); });
+            RunUploaderOperation(new UploaderOperation(
+                "official-upload-cached",
+                UploadProgressStages,
+                0,
+                async (workflow, token) =>
+                {
+                    await workflow.UploadCachedOfficial(token);
+                    return null;
+                }));
 
         private void RunBuildCacheAndUploadConcurrent() =>
-            _ = RunExclusive("build-cache-concurrent-upload", BuildUploadProgressStages, GetConcurrentWorkerBars(),
-                async token =>
-                {
-                    var manifest = await CreateWorkflow().BuildCacheAndUploadConcurrent(token);
-                    UpdateAvatarInfo(_avatar.Descriptor);
-                    _selectedBundlePath = manifest.bundlePath;
-                });
+            RunUploaderOperation(new UploaderOperation(
+                "build-cache-concurrent-upload",
+                BuildUploadProgressStages,
+                GetConcurrentWorkerBars(),
+                (workflow, token) => workflow.BuildCacheAndUploadConcurrent(token),
+                refreshAvatarAfter: true,
+                selectManifestAfter: true));
 
         private void RunBuildCacheAndUploadOfficial() =>
-            _ = RunExclusive("build-cache-official-upload", BuildUploadProgressStages, 0,
-                async token =>
-                {
-                    var manifest = await CreateWorkflow().BuildCacheAndUploadOfficial(token);
-                    UpdateAvatarInfo(_avatar.Descriptor);
-                    _selectedBundlePath = manifest.bundlePath;
-                });
+            RunUploaderOperation(new UploaderOperation(
+                "build-cache-official-upload",
+                BuildUploadProgressStages,
+                0,
+                (workflow, token) => workflow.BuildCacheAndUploadOfficial(token),
+                refreshAvatarAfter: true,
+                selectManifestAfter: true));
 
-        private async Task RunExclusive(
-            string operationName,
-            AvatarUploadProgressStage[] progressStages,
-            int workerBars,
-            Func<CancellationToken, Task> operation)
+        private void RunUploaderOperation(UploaderOperation operation) =>
+            _ = RunExclusive(operation);
+
+        private async Task RunExclusive(UploaderOperation operation)
         {
             if (_operation.Busy)
             {
@@ -602,14 +594,33 @@ namespace Elypha.VRChatUploader
             }
 
             _operation.Busy = true;
-            _operation.Begin(progressStages, workerBars);
+            _operation.Begin(operation.ProgressStages, operation.WorkerBars);
             _operation.Cancellation = new CancellationTokenSource();
-            _log.Begin(operationName);
+            var progressSink = new EditorOperationProgressSink(this, ++_operationSerial);
+            var workflow = CreateWorkflow(progressSink);
+            _log.Begin(operation.Name);
 
             var watch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                await operation(_operation.Cancellation.Token);
+                CachedAvatarBundleManifest manifest = null;
+                try
+                {
+                    manifest = await operation.Execute(workflow, _operation.Cancellation.Token);
+                }
+                finally
+                {
+                    if (operation.RefreshAvatarAfter)
+                    {
+                        UpdateAvatarInfo(_avatar.Descriptor);
+                    }
+
+                    if (operation.SelectManifestAfter && manifest != null)
+                    {
+                        _selectedBundlePath = manifest.bundlePath;
+                    }
+                }
+
                 SetProgress("Done", 1f);
             }
             catch (OperationCanceledException)
@@ -619,7 +630,7 @@ namespace Elypha.VRChatUploader
             }
             catch (Exception ex)
             {
-                _log.Info("Failed: " + ex.Message);
+                _log.Error("Failed", ex);
                 Debug.LogException(ex);
                 SetProgress("Failed", 0f);
             }
@@ -628,6 +639,7 @@ namespace Elypha.VRChatUploader
                 watch.Stop();
                 _log.Info($"Operation finished after {watch.Elapsed.TotalSeconds:F2}s.");
                 _log.End();
+                _operationSerial++;
                 _operation.Cancellation.Dispose();
                 _operation.Cancellation = null;
                 _operation.Busy = false;
@@ -637,51 +649,26 @@ namespace Elypha.VRChatUploader
             }
         }
 
-        private AvatarUploadWorkflow CreateWorkflow()
+        private AvatarUploadWorkflow CreateWorkflow(EditorOperationProgressSink progressSink)
         {
             return new AvatarUploadWorkflow(new AvatarUploadRequest
             {
                 AvatarRoot = _avatar.Root,
                 NewAvatarName = _newAvatarName,
                 NewAvatarReleaseStatus = _newAvatarReleaseStatus,
-                CoverImagePath = _coverImagePath,
                 CachedBundlePath = _selectedBundlePath,
                 UploadAttempts = _uploadAttempts,
                 RetryDelaySeconds = _retryDelaySeconds,
                 ConcurrentWorkers = _concurrentWorkers,
                 ConcurrentPartSizeMiB = _concurrentPartSizeMiB
-            }, _log.Info, SetProgressSafe, SetWorkerProgressSafe);
+            }, _log, progressSink.ReportStage, progressSink.ReportWorker);
         }
 
         private void RefreshCacheEntries()
         {
-            _allCacheEntries = AvatarBuildCache.ListRecent();
+            _allCacheEntries = AvatarBuildCache.ListRecent(_log);
             ClearInvalidCacheSelection();
             Repaint();
-        }
-
-        private void SetProgressSafe(AvatarUploadProgressStage stage, string status, float percentage)
-        {
-            _operation.SetStageProgress(stage, status, percentage);
-            EditorApplication.delayCall += () =>
-            {
-                if (this == null || !_operation.Busy) return;
-
-                EditorUtility.DisplayProgressBar(WindowTitle, _operation.StatusText, _operation.CurrentProgress);
-                Repaint();
-            };
-        }
-
-        private void SetWorkerProgressSafe(int workerIndex, string status, float percentage)
-        {
-            if (!_operation.SetWorkerProgress(workerIndex, status, percentage)) return;
-
-            EditorApplication.delayCall += () =>
-            {
-                if (this == null || !_operation.Busy) return;
-
-                Repaint();
-            };
         }
 
         private void SetProgress(string status, float percentage)
@@ -715,35 +702,19 @@ namespace Elypha.VRChatUploader
             }
         }
 
-        private static void OpenCacheFolder()
-        {
-            Directory.CreateDirectory(AvatarBuildCache.CacheDirectory);
-            EditorUtility.RevealInFinder(AvatarBuildCache.CacheDirectory);
-        }
-
-        // semantic status
+        // Readiness
         // --------------------------------
-        private bool IsBundlePathSelected() => !string.IsNullOrWhiteSpace(_selectedBundlePath);
-        private bool CanEditCover() => _avatar.HasPipeline && _remoteCheck.IsReady && _avatar.IsNewAvatar;
-
         private bool IsAvatarInfoReady() =>
             _avatar.HasPipeline
             && _remoteCheck.IsReady
-            && (_remoteCheck.Phase != RemoteAvatarCheckPhase.NotNeeded || !string.IsNullOrWhiteSpace(_newAvatarName))
-            && (!_avatar.IsNewAvatar || !string.IsNullOrWhiteSpace(_coverImagePath));
+            && (!_avatar.IsNewAvatar || !string.IsNullOrWhiteSpace(_newAvatarName));
 
         private bool CanUploadCachedBundle() =>
             IsAvatarInfoReady()
             && _remoteCheck.Phase != RemoteAvatarCheckPhase.NotNeeded
-            && IsBundlePathSelected();
+            && !string.IsNullOrWhiteSpace(_selectedBundlePath);
 
-        private bool IsCurrentRemoteCheck(string blueprintId, int serial) =>
-            _remoteCheck.IsCurrent(blueprintId, serial);
-
-        private bool CanRetryRemoteCheck() =>
-            _remoteCheck.CanRetry;
-
-        // function helper
+        // General helpers
         // --------------------------------
         private static bool TryGetAvatarDescriptorInParents(GameObject obj, out VRC_AvatarDescriptor avatarDescriptor)
         {
@@ -763,6 +734,11 @@ namespace Elypha.VRChatUploader
             {
                 return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
             }
+        }
+
+        private static string NormalizeReleaseStatus(string value)
+        {
+            return Array.IndexOf(ReleaseStatusOptions, value) >= 0 ? value : "private";
         }
 
         // UI helper

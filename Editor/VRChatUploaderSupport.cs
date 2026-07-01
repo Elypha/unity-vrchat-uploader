@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using UnityEngine;
+using VRC.SDKBase.Editor.Api;
 
 namespace Elypha.VRChatUploader
 {
@@ -23,6 +26,7 @@ namespace Elypha.VRChatUploader
     {
         private readonly List<string> lines = new();
         private string activeLogPath;
+        private bool logWriteWarningEmitted;
 
         public IReadOnlyList<string> Lines => lines;
 
@@ -32,6 +36,7 @@ namespace Elypha.VRChatUploader
             activeLogPath = Path.Combine(
                 AvatarBuildCache.CacheDirectory,
                 $"{DateTime.Now:yyyyMMdd-HHmmss}_{AvatarFileUtil.SanitizeFileName(operationName)}.log");
+            logWriteWarningEmitted = false;
             lines.Clear();
             Info("Operation started: " + operationName);
             Info("Log file: " + activeLogPath);
@@ -44,12 +49,57 @@ namespace Elypha.VRChatUploader
 
         public void Info(string message)
         {
-            var line = $"[{DateTime.Now:HH:mm:ss}] {message}";
-            lines.Add(line);
-            while (lines.Count > 240)
+            Write("INFO", message);
+        }
+
+        public void Warn(string message)
+        {
+            Write("WARN", message);
+        }
+
+        public void Error(string message)
+        {
+            Write("ERROR", message);
+        }
+
+        public void Error(string prefix, Exception ex)
+        {
+            Error(prefix + ": " + FormatException(ex));
+        }
+
+        public static string FormatException(Exception ex)
+        {
+            if (ex == null)
             {
-                lines.RemoveAt(0);
+                return "";
             }
+
+            if (ex is AggregateException aggregateException)
+            {
+                return string.Join("; ", aggregateException.Flatten().InnerExceptions.Select(FormatException));
+            }
+
+            string message;
+            if (ex is ApiErrorException apiError)
+            {
+                message = string.IsNullOrWhiteSpace(apiError.ErrorMessage) ? apiError.Message : apiError.ErrorMessage;
+                message = $"VRChat API error {apiError.StatusCode}: {message}";
+            }
+            else
+            {
+                message = string.IsNullOrWhiteSpace(ex.Message) ? ex.GetType().Name : $"{ex.GetType().Name}: {ex.Message}";
+            }
+
+            return ex.InnerException == null
+                ? message
+                : message + " Inner: " + FormatException(ex.InnerException);
+        }
+
+        private void Write(string level, string message)
+        {
+            var prefix = level == "INFO" ? "" : level + ": ";
+            var line = $"[{DateTime.Now:HH:mm:ss}] {prefix}{message}";
+            AddLine(line);
 
             if (!string.IsNullOrWhiteSpace(activeLogPath))
             {
@@ -57,12 +107,30 @@ namespace Elypha.VRChatUploader
                 {
                     File.AppendAllText(activeLogPath, line + Environment.NewLine);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Log IO must not break an upload operation.
+                    if (logWriteWarningEmitted)
+                    {
+                        return;
+                    }
+
+                    logWriteWarningEmitted = true;
+                    var warning = $"[{DateTime.Now:HH:mm:ss}] WARN: Log file write failed: {ex.Message}";
+                    AddLine(warning);
+                    Debug.LogWarning(warning);
                 }
             }
         }
+
+        private void AddLine(string line)
+        {
+            lines.Add(line);
+            while (lines.Count > 240)
+            {
+                lines.RemoveAt(0);
+            }
+        }
+
     }
 
     internal static class AvatarFileUtil
@@ -122,6 +190,11 @@ namespace Elypha.VRChatUploader
                     return "application/x-avatar";
                 case ".sig":
                     return "application/x-rsync-signature";
+                case ".jpg":
+                case ".jpeg":
+                    return "image/jpeg";
+                case ".png":
+                    return "image/png";
                 default:
                     return "application/octet-stream";
             }
